@@ -1,11 +1,12 @@
 import express from "express";
 import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 
 const app = express();
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 
-// Instances to try (primary first). You can override with INVIDIOUS_BASE_URL env var.
+// Primary instance can be overridden with env var
 const INVIDIOUS_INSTANCES = [
   (process.env.INVIDIOUS_BASE_URL || "https://invidious.nerdvpn.de").replace(/\/+$/, ""),
   "https://yewtu.cafe",
@@ -15,6 +16,14 @@ const INVIDIOUS_INSTANCES = [
 // Simple in-memory cache
 const cache = new Map();
 const CACHE_TTL_MS = Number(process.env.SEARCH_CACHE_TTL_MS || 60_000);
+
+// Rate limiter for /search to protect upstream instances
+const searchLimiter = rateLimit({
+  windowMs: 60_000,
+  max: Number(process.env.SEARCH_RATE_LIMIT || 60),
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 function cacheKey(prefix, q, opts = {}) {
   const hash = crypto.createHash("sha1").update(JSON.stringify({ q, opts })).digest("hex");
@@ -28,9 +37,9 @@ function getCache(key) {
   return entry.value;
 }
 
-// CORS
+// CORS middleware
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
   res.header("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.sendStatus(200);
@@ -40,22 +49,41 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => res.send("ok"));
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Helper to call fetch, with dynamic fallback to node-fetch if needed
-async function doFetch(url, opts = {}) {
+// fetch helper with dynamic fallback and timeout
+async function doFetch(url, opts = {}, timeoutMs = 8000) {
+  const headers = opts.headers || {};
   if (typeof global.fetch === "function") {
-    return global.fetch(url, opts);
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const r = await global.fetch(url, { ...opts, signal: controller.signal, headers });
+      clearTimeout(id);
+      return r;
+    } catch (err) {
+      clearTimeout(id);
+      throw err;
+    }
   }
-  // dynamic import of node-fetch for older Node versions
   const mod = await import("node-fetch");
   const fetchFn = mod.default || mod;
-  return fetchFn(url, opts);
+  const { AbortController } = await import("abort-controller").catch(() => ({ AbortController: global.AbortController }));
+  const controller = new (AbortController)();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetchFn(url, { ...opts, signal: controller.signal, headers });
+    clearTimeout(id);
+    return r;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
 }
 
 async function tryInstances(path) {
   for (const base of INVIDIOUS_INSTANCES) {
     try {
       const url = `${base}${path}`;
-      const r = await doFetch(url, { headers: { "User-Agent": "invidious-proxy/1.0" } });
+      const r = await doFetch(url, { headers: { "User-Agent": "invidious-proxy/1.0" } }, Number(process.env.UPSTREAM_TIMEOUT_MS || 8000));
       if (!r.ok) {
         console.warn("Upstream failed", base, r.status);
         continue;
@@ -70,7 +98,8 @@ async function tryInstances(path) {
   throw new Error("All upstream instances failed");
 }
 
-app.get("/search", async (req, res) => {
+// /search with rate limiting and caching
+app.get("/search", searchLimiter, async (req, res) => {
   try {
     const q = (req.query.q || "").toString().trim();
     if (!q) return res.status(400).json({ error: "Missing query parameter q" });
@@ -101,6 +130,7 @@ app.get("/search", async (req, res) => {
   }
 });
 
+// /video/:id proxy with caching
 app.get("/video/:id", async (req, res) => {
   try {
     const id = req.params.id;
