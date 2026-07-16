@@ -35,11 +35,24 @@ app.get("/stream", async (req, res) => {
 
   try {
     const info = await ytdl.getInfo(id);
-    const format = ytdl.chooseFormat(info.formats, { quality: "highestaudio" });
+
+    let format = ytdl.chooseFormat(info.formats, { filter: "audioonly" });
+
+    if (!format || !format.url) {
+      format = ytdl.chooseFormat(info.formats, { quality: "highestaudio" });
+    }
+
+    if (!format || !format.url) {
+      format = info.formats.find(f => f.url);
+    }
+
+    if (!format || !format.url) {
+      return res.status(500).send("No playable audio stream found");
+    }
 
     res.redirect(format.url);
   } catch (err) {
-    console.error(err);
+    console.error("STREAM ERROR:", err);
     res.status(500).send("Error streaming");
   }
 });
