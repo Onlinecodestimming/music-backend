@@ -65,11 +65,12 @@ app.get("/video/:id", async (req, res) => {
 
         const info = await yt.getInfo(id);
 
-        // NEW: YouTubei.js requires this call to populate streaming_data
+        // REQUIRED: populate streaming_data
         const streaming = await info.getStreamingData();
 
         const formats = streaming?.adaptive_formats || [];
 
+        // Find audio-only stream
         const audio = formats.find(f => f.mime_type?.includes("audio"));
 
         if (!audio || !audio.url) {
