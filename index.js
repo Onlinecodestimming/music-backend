@@ -46,8 +46,8 @@ app.get("/search", searchLimiter, async (req, res) => {
 
         const items = results.videos.map(v => ({
             id: v.id,
-           title: v.title?.text || v.title || "Unknown",
-author: v.author?.name || "Unknown",
+            title: v.title?.text || v.title || "Unknown",
+            author: v.author?.name || "Unknown",
             thumbnails: v.thumbnails
         }));
 
@@ -64,21 +64,19 @@ app.get("/video/:id", async (req, res) => {
         const id = req.params.id;
 
         const info = await yt.getInfo(id);
-        const streaming = info.streaming_data;
 
-        if (!streaming || !streaming.adaptive_formats) {
-            return res.status(500).json({ error: "No audio streams found" });
-        }
+        // NEW: YouTubei.js now stores streams in info.streaming_data?.adaptive_formats
+        const streaming = info?.streaming_data;
+        const formats = streaming?.adaptive_formats || [];
 
-        const audio = streaming.adaptive_formats.find(f => f.mime_type.includes("audio"));
+        // Find an audio-only stream
+        const audio = formats.find(f => f.mime_type?.includes("audio"));
 
-        if (!audio) {
+        if (!audio || !audio.url) {
             return res.status(500).json({ error: "No audio stream available" });
         }
 
-res.json({
-    url: audio.url
-});
+        res.json({ url: audio.url });
 
     } catch (err) {
         console.error("Video error:", err);
