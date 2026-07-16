@@ -30,7 +30,6 @@ async function safeJSON(url) {
     }
 }
 
-// SEARCH (Monochrome only)
 app.get("/search", searchLimiter, async (req, res) => {
     try {
         const q = (req.query.q || "").trim();
@@ -38,9 +37,12 @@ app.get("/search", searchLimiter, async (req, res) => {
 
         const mono = await safeJSON(`https://monochrome.tf/search/${encodeURIComponent(q)}`);
 
-        const items = mono.results.map(item => {
+        // FIX: ensure results exist and are an array
+        const results = Array.isArray(mono.results) ? mono.results : [];
+
+        const items = results.map(item => {
             const preview = item.preview || "";
-            const format = preview.split(".").pop(); // flac, m4a, etc.
+            const format = preview.split(".").pop();
 
             return {
                 id: item.id,
@@ -51,6 +53,14 @@ app.get("/search", searchLimiter, async (req, res) => {
                 format
             };
         });
+
+        res.json({ items });
+    } catch (err) {
+        console.error("Search error:", err);
+        res.status(500).json({ error: "Search failed" });
+    }
+});
+
 
         res.json({ items });
     } catch (err) {
