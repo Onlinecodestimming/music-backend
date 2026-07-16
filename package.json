@@ -1,17 +1,15 @@
 {
-  "name": "invidious-proxy",
+  "name": "rhema-music-backend",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Self-hosted YouTube music backend using YouTubei.js",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^3.3.1",
-    "express-rate-limit": "^6.7.0"
+    "express-rate-limit": "^6.7.0",
+    "youtubei.js": "^6.3.0"
   }
 }
