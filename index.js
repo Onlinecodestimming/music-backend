@@ -76,17 +76,24 @@ app.get("/play/:id", async (req, res) => {
 
         const mono = await safeJSON(`https://monochrome.tf/track/${id}`);
 
+        // FIX: ensure preview exists
         if (!mono.preview) {
             return res.status(500).json({ error: "No preview available" });
         }
 
         const preview = mono.preview;
-        const format = preview.split(".").pop(); // flac, m4a, etc.
+        const format = preview.split(".").pop();
 
         res.json({
             url: preview,
             format
         });
+    } catch (err) {
+        console.error("Play error:", err);
+        res.status(500).json({ error: "Play failed" });
+    }
+});
+
     } catch (err) {
         console.error("Play error:", err);
         res.status(500).json({ error: "Play failed" });
