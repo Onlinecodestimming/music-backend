@@ -1,34 +1,38 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 import ytdl from "@distube/ytdl-core";
+import yts from "yt-search";
 
 const app = express();
 app.use(cors());
 
-// YOUTUBE SEARCH (Piped API)
+// HOME ROUTE (optional)
+app.get("/", (req, res) => {
+  res.send("Rhema Music Backend is running");
+});
+
+// SEARCH ROUTE
 app.get("/search", async (req, res) => {
   const q = req.query.q;
   if (!q) return res.json({ items: [] });
 
   try {
-    const url = `https://pipedapi.kavin.rocks/search?q=${encodeURIComponent(q)}`;
-    const data = await fetch(url).then(r => r.json());
+    const r = await yts(q);
 
-    const items = data.items.map(v => ({
-      id: v.id,
+    const items = r.videos.slice(0, 10).map(v => ({
+      id: v.videoId,
       title: v.title,
-      channel: v.uploader
+      channel: v.author.name
     }));
 
     res.json({ items });
   } catch (err) {
-    console.error(err);
+    console.error("SEARCH ERROR:", err);
     res.json({ items: [] });
   }
 });
 
-// YOUTUBE STREAM
+// STREAM ROUTE
 app.get("/stream", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).send("Missing id");
@@ -36,12 +40,15 @@ app.get("/stream", async (req, res) => {
   try {
     const info = await ytdl.getInfo(id);
 
+    // Try audio-only formats first
     let format = ytdl.chooseFormat(info.formats, { filter: "audioonly" });
 
+    // Fallback: highest audio quality
     if (!format || !format.url) {
       format = ytdl.chooseFormat(info.formats, { quality: "highestaudio" });
     }
 
+    // Final fallback: ANY playable format
     if (!format || !format.url) {
       format = info.formats.find(f => f.url);
     }
@@ -57,4 +64,8 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log("Backend running on Railway"));
+// START SERVER
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+});
