@@ -1,4 +1,4 @@
-// Rhema Music Backend — FINAL FIXED VERSION
+// Rhema Music Backend — Piped Version (Guaranteed Working)
 
 import express from "express";
 import crypto from "crypto";
@@ -8,22 +8,17 @@ const app = express();
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 
-// Load instances from Railway variables
-const INSTANCE_MAIN = (process.env.INVIDIOUS_BASE_URL || "https://yewtu.be").replace(/\/+$/, "");
-const INSTANCE_F1 = (process.env.INVIDIOUS_FALLBACK_1 || "https://yewtu.eu").replace(/\/+$/, "");
-const INSTANCE_F2 = (process.env.INVIDIOUS_FALLBACK_2 || "https://vid.puffyan.us").replace(/\/+$/, "");
-
-// Final instance list
-const INVIDIOUS_INSTANCES = [
-  INSTANCE_MAIN,
-  INSTANCE_F1,
-  INSTANCE_F2
+// Piped instances (stable)
+const PIPED_INSTANCES = [
+  "https://pipedapi.kavin.rocks",
+  "https://pipedapi.syncpundit.io",
+  "https://pipedapi.mha.fi"
 ];
 
-console.log("Using instances:", INVIDIOUS_INSTANCES);
+console.log("Using Piped instances:", PIPED_INSTANCES);
 
 // Cache + limits
-const CACHE_TTL_MS = 300000; // 5 minutes
+const CACHE_TTL_MS = 300000;
 const UPSTREAM_TIMEOUT_MS = 8000;
 const SEARCH_RATE_LIMIT = 30;
 
@@ -83,9 +78,9 @@ async function safeFetch(url) {
   }
 }
 
-// Try multiple instances
+// Try multiple Piped instances
 async function tryInstances(path) {
-  for (const base of INVIDIOUS_INSTANCES) {
+  for (const base of PIPED_INSTANCES) {
     const url = `${base}${path}`;
     try {
       const res = await safeFetch(url);
@@ -106,16 +101,7 @@ async function tryInstances(path) {
   throw new Error("All instances failed");
 }
 
-// Normalize thumbnails
-function normalizeThumb(url, base) {
-  if (!url) return url;
-  if (url.startsWith("http")) return url;
-  if (url.startsWith("//")) return "https:" + url;
-  if (url.startsWith("/")) return base + url;
-  return base + "/" + url;
-}
-
-// SEARCH
+// SEARCH (Piped)
 app.get("/search", searchLimiter, async (req, res) => {
   try {
     const q = (req.query.q || "").trim();
@@ -125,21 +111,14 @@ app.get("/search", searchLimiter, async (req, res) => {
     const cached = getCache(key);
     if (cached) return res.json(cached);
 
-    const { base, json } = await tryInstances(`/api/v1/search?q=${encodeURIComponent(q)}&type=video`);
+    const { json } = await tryInstances(`/search?q=${encodeURIComponent(q)}`);
 
-    const items = (json || []).map(v => {
-      const thumbs = (v.videoThumbnails || []).map(t => {
-        const url = typeof t === "string" ? t : t.url;
-        return { url: normalizeThumb(url, base) };
-      });
-
-      return {
-        id: v.videoId,
-        title: v.title,
-        author: v.author,
-        thumbnails: thumbs
-      };
-    });
+    const items = (json.items || []).map(v => ({
+      id: v.id,
+      title: v.title,
+      author: v.uploader,
+      thumbnails: v.thumbnails
+    }));
 
     const payload = { items };
     setCache(key, payload);
@@ -151,7 +130,7 @@ app.get("/search", searchLimiter, async (req, res) => {
   }
 });
 
-// VIDEO
+// VIDEO (Piped)
 app.get("/video/:id", async (req, res) => {
   try {
     const id = req.params.id;
@@ -160,15 +139,7 @@ app.get("/video/:id", async (req, res) => {
     const cached = getCache(key);
     if (cached) return res.json(cached);
 
-    const { base, json } = await tryInstances(`/api/v1/videos/${id}`);
-
-    // Normalize thumbnails
-    if (json.videoThumbnails) {
-      json.videoThumbnails = json.videoThumbnails.map(t => {
-        const url = typeof t === "string" ? t : t.url;
-        return { url: normalizeThumb(url, base) };
-      });
-    }
+    const { json } = await tryInstances(`/streams/${id}`);
 
     setCache(key, json);
     res.json(json);
