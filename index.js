@@ -1,30 +1,14 @@
-// Rhema Music Backend — YouTubei.js Version (Self-Hosted, No Blocks)
-
 import express from "express";
-import { Innertube } from "youtubei.js";
 import rateLimit from "express-rate-limit";
+import fetch from "node-fetch";
 
 const app = express();
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 
-// Initialize YouTube client
-let yt;
-(async () => {
-    yt = await Innertube.create({
-        generate_session_locally: true,
-        retrieve_player: true,
-        retrieve_pbp: true
-    });
-    console.log("YouTubei.js initialized");
-})();
-
-// Rate limit
 const searchLimiter = rateLimit({
     windowMs: 60000,
-    max: 30,
-    standardHeaders: true,
-    legacyHeaders: false
+    max: 30
 });
 
 // CORS
@@ -36,20 +20,37 @@ app.use((req, res, next) => {
     next();
 });
 
-// SEARCH endpoint
+// Safe JSON fetch
+async function safeJSON(url) {
+    try {
+        const res = await fetch(url);
+        return await res.json();
+    } catch {
+        return { results: [] };
+    }
+}
+
+// SEARCH (Monochrome only)
 app.get("/search", searchLimiter, async (req, res) => {
     try {
         const q = (req.query.q || "").trim();
         if (!q) return res.status(400).json({ error: "Missing q" });
 
-        const results = await yt.search(q, { type: "video" });
+        const mono = await safeJSON(`https://monochrome.tf/search/${encodeURIComponent(q)}`);
 
-        const items = results.videos.map(v => ({
-            id: v.id,
-            title: v.title?.text || v.title || "Unknown",
-            author: v.author?.name || "Unknown",
-            thumbnails: v.thumbnails
-        }));
+        const items = mono.results.map(item => {
+            const preview = item.preview || "";
+            const format = preview.split(".").pop(); // flac, m4a, etc.
+
+            return {
+                id: item.id,
+                title: item.title,
+                artist: item.artist,
+                thumbnail: item.thumbnail,
+                preview,
+                format
+            };
+        });
 
         res.json({ items });
     } catch (err) {
@@ -58,33 +59,30 @@ app.get("/search", searchLimiter, async (req, res) => {
     }
 });
 
-// VIDEO endpoint (audio stream)
-app.get("/video/:id", async (req, res) => {
+// PLAY (Monochrome only)
+app.get("/play/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        const info = await yt.getInfo(id);
+        const mono = await safeJSON(`https://monochrome.tf/track/${id}`);
 
-        // REQUIRED: populate streaming_data
-        const streaming = await info.getStreamingData();
-
-        const formats = streaming?.adaptive_formats || [];
-
-        // Find audio-only stream
-        const audio = formats.find(f => f.mime_type?.includes("audio"));
-
-        if (!audio || !audio.url) {
-            return res.status(500).json({ error: "No audio stream available" });
+        if (!mono.preview) {
+            return res.status(500).json({ error: "No preview available" });
         }
 
-        res.json({ url: audio.url });
+        const preview = mono.preview;
+        const format = preview.split(".").pop(); // flac, m4a, etc.
 
+        res.json({
+            url: preview,
+            format
+        });
     } catch (err) {
-        console.error("Video error:", err);
-        res.status(500).json({ error: "Video fetch failed" });
+        console.error("Play error:", err);
+        res.status(500).json({ error: "Play failed" });
     }
 });
 
 app.listen(PORT, HOST, () => {
-    console.log(`Rhema Music backend running at http://${HOST}:${PORT}`);
+    console.log(`Monochrome-only backend with FLAC support running at http://${HOST}:${PORT}`);
 });
