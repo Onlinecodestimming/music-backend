@@ -76,11 +76,10 @@ app.get("/video/:id", async (req, res) => {
             return res.status(500).json({ error: "No audio stream available" });
         }
 
-        res.json({
-            url: audio.url,
-            bitrate: audio.bitrate,
-            mime: audio.mime_type
-        });
+res.json({
+    url: audio.url
+});
+
     } catch (err) {
         console.error("Video error:", err);
         res.status(500).json({ error: "Video fetch failed" });
