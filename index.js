@@ -1,12 +1,14 @@
 import express from "express";
 import cors from "cors";
 import ytdl from "@distube/ytdl-core";
-import yts from "yt-search";
+import pkg from "yt-search";
+
+const yts = pkg;
 
 const app = express();
 app.use(cors());
 
-// HOME ROUTE (optional)
+// HOME ROUTE
 app.get("/", (req, res) => {
   res.send("Rhema Music Backend is running");
 });
@@ -17,7 +19,7 @@ app.get("/search", async (req, res) => {
   if (!q) return res.json({ items: [] });
 
   try {
-    const r = await yts(q);
+    const r = await yts.search(q);
 
     const items = r.videos.slice(0, 10).map(v => ({
       id: v.videoId,
@@ -40,15 +42,12 @@ app.get("/stream", async (req, res) => {
   try {
     const info = await ytdl.getInfo(id);
 
-    // Try audio-only formats first
     let format = ytdl.chooseFormat(info.formats, { filter: "audioonly" });
 
-    // Fallback: highest audio quality
     if (!format || !format.url) {
       format = ytdl.chooseFormat(info.formats, { quality: "highestaudio" });
     }
 
-    // Final fallback: ANY playable format
     if (!format || !format.url) {
       format = info.formats.find(f => f.url);
     }
