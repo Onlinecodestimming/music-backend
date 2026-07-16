@@ -1,4 +1,4 @@
-// NEW CLEAN WORKING index.js — Rhema Music Backend
+// Rhema Music Backend — FINAL FIXED VERSION
 
 import express from "express";
 import crypto from "crypto";
@@ -8,15 +8,22 @@ const app = express();
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 
-// WORKING Invidious instances
+// Load instances from Railway variables
+const INSTANCE_MAIN = (process.env.INVIDIOUS_BASE_URL || "https://yewtu.be").replace(/\/+$/, "");
+const INSTANCE_F1 = (process.env.INVIDIOUS_FALLBACK_1 || "https://yewtu.eu").replace(/\/+$/, "");
+const INSTANCE_F2 = (process.env.INVIDIOUS_FALLBACK_2 || "https://vid.puffyan.us").replace(/\/+$/, "");
+
+// Final instance list
 const INVIDIOUS_INSTANCES = [
-  "https://yewtu.be",
-  "https://yewtu.eu",
-  "https://vid.puffyan.us"
+  INSTANCE_MAIN,
+  INSTANCE_F1,
+  INSTANCE_F2
 ];
 
+console.log("Using instances:", INVIDIOUS_INSTANCES);
+
 // Cache + limits
-const CACHE_TTL_MS = 300000; // 5 min
+const CACHE_TTL_MS = 300000; // 5 minutes
 const UPSTREAM_TIMEOUT_MS = 8000;
 const SEARCH_RATE_LIMIT = 30;
 
