@@ -46,8 +46,8 @@ app.get("/search", searchLimiter, async (req, res) => {
 
         const items = results.videos.map(v => ({
             id: v.id,
-            title: v.title,
-            author: v.author?.name || "Unknown",
+           title: v.title?.text || v.title || "Unknown",
+author: v.author?.name || "Unknown",
             thumbnails: v.thumbnails
         }));
 
