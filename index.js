@@ -10,7 +10,8 @@ const PORT = Number(process.env.PORT || 3000);
 const INVIDIOUS_INSTANCES = [
   (process.env.INVIDIOUS_BASE_URL || "https://invidious.nerdvpn.de").replace(/\/+$/, ""),
   "https://yewtu.cafe",
-  "https://yewtu.eu"
+  "https://yewtu.eu",
+  "https://yt.chocolatemoo53.com"
 ];
 
 // Simple in-memory cache
