@@ -1,13 +1,16 @@
 import express from "express";
-import process from "process";
 import crypto from "crypto";
 
 const app = express();
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
 
-// Default to the instance you requested
-const INVIDIOUS_BASE_URL = (process.env.INVIDIOUS_BASE_URL || "https://invidious.nerdvpn.de").replace(/\/+$/, "");
+// Instances to try (primary first). You can override with INVIDIOUS_BASE_URL env var.
+const INVIDIOUS_INSTANCES = [
+  (process.env.INVIDIOUS_BASE_URL || "https://invidious.nerdvpn.de").replace(/\/+$/, ""),
+  "https://yewtu.cafe",
+  "https://yewtu.eu"
+];
 
 // Simple in-memory cache
 const cache = new Map();
@@ -25,7 +28,7 @@ function getCache(key) {
   return entry.value;
 }
 
-// CORS middleware
+// CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,OPTIONS");
@@ -35,6 +38,37 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (req, res) => res.send("ok"));
+app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+// Helper to call fetch, with dynamic fallback to node-fetch if needed
+async function doFetch(url, opts = {}) {
+  if (typeof global.fetch === "function") {
+    return global.fetch(url, opts);
+  }
+  // dynamic import of node-fetch for older Node versions
+  const mod = await import("node-fetch");
+  const fetchFn = mod.default || mod;
+  return fetchFn(url, opts);
+}
+
+async function tryInstances(path) {
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const url = `${base}${path}`;
+      const r = await doFetch(url, { headers: { "User-Agent": "invidious-proxy/1.0" } });
+      if (!r.ok) {
+        console.warn("Upstream failed", base, r.status);
+        continue;
+      }
+      const json = await r.json();
+      return { base, json };
+    } catch (err) {
+      console.warn("Instance error", base, err && err.message);
+      continue;
+    }
+  }
+  throw new Error("All upstream instances failed");
+}
 
 app.get("/search", async (req, res) => {
   try {
@@ -45,37 +79,25 @@ app.get("/search", async (req, res) => {
     const cached = getCache(key);
     if (cached) return res.json(cached);
 
-    const url = `${INVIDIOUS_BASE_URL}/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
-    const r = await fetch(url, { headers: { "User-Agent": "invidious-proxy/1.0" } });
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      console.error("Invidious search error", r.status, text);
-      return res.status(502).json({ error: "Upstream search failed", status: r.status });
-    }
-
-    const data = await r.json();
-    const items = (Array.isArray(data) ? data : []).map(v => ({
+    const { base, json } = await tryInstances(`/api/v1/search?q=${encodeURIComponent(q)}&type=video`);
+    const items = (Array.isArray(json) ? json : []).map(v => ({
       id: v.videoId || v.video_id || v.id,
       title: v.title,
-      author: v.author || v.uploader || v.channelTitle,
+      author: v.author || v.uploader || null,
       lengthSeconds: v.lengthSeconds || v.duration || null,
       published: v.published || v.publishedText || null,
       viewCount: v.viewCount || v.views || null,
-      thumbnails: (v.videoThumbnails || v.thumbnails || []).map(t => ({
-        url: t.url || t,
-        width: t.width || null,
-        height: t.height || null
-      })),
+      thumbnails: (v.videoThumbnails || v.thumbnails || []).map(t => ({ url: t.url || t })),
       description: v.description || null
     }));
 
     const payload = { items };
     setCache(key, payload);
+    res.setHeader("X-Invidious-Instance", base);
     res.json(payload);
   } catch (err) {
     console.error("Search handler error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(502).json({ error: "Upstream search failed" });
   }
 });
 
@@ -88,25 +110,17 @@ app.get("/video/:id", async (req, res) => {
     const cached = getCache(key);
     if (cached) return res.json(cached);
 
-    const url = `${INVIDIOUS_BASE_URL}/api/v1/videos/${encodeURIComponent(id)}`;
-    const r = await fetch(url, { headers: { "User-Agent": "invidious-proxy/1.0" } });
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      console.error("Invidious video error", r.status, text);
-      return res.status(502).json({ error: "Upstream video fetch failed", status: r.status });
-    }
-    const data = await r.json();
-    setCache(key, data);
-    res.json(data);
+    const { base, json } = await tryInstances(`/api/v1/videos/${encodeURIComponent(id)}`);
+    setCache(key, json);
+    res.setHeader("X-Invidious-Instance", base);
+    res.json(json);
   } catch (err) {
     console.error("Video handler error:", err);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(502).json({ error: "Upstream video fetch failed" });
   }
 });
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-
 app.listen(PORT, HOST, () => {
-  console.log(`Diagnostic server listening on http://${HOST}:${PORT}`);
-  console.log(`Using Invidious base URL: ${INVIDIOUS_BASE_URL}`);
+  console.log(`Server listening on http://${HOST}:${PORT}`);
+  console.log(`Invidious instances: ${INVIDIOUS_INSTANCES.join(", ")}`);
 });
