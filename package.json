@@ -1,13 +1,11 @@
-console.log("BOOT: script started");
-import express from "express";
-console.log("BOOT: express imported");
-
-const app = express();
-const PORT = Number(process.env.PORT || 3000);
-console.log("BOOT: PORT is", PORT);
-
-app.get("/", (req, res) => res.send("ok"));
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`BOOT: listening on ${PORT}`);
-});
+{
+  "name": "music-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
