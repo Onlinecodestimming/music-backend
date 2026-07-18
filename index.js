@@ -1,105 +1,66 @@
 import express from "express";
-import rateLimit from "express-rate-limit";
 import fetch from "node-fetch";
+import cors from "cors";
 
 const app = express();
-const HOST = process.env.HOST || "0.0.0.0";
-const PORT = Number(process.env.PORT || 3000);
+const PORT = 3000;
 
-const searchLimiter = rateLimit({
-    windowMs: 60000,
-    max: 30
-});
+app.use(cors());
+app.use(express.json());
 
-// CORS
-app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Methods", "GET,OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type");
-    if (req.method === "OPTIONS") return res.sendStatus(200);
-    next();
-});
-
-// Safe JSON fetch
-async function safeJSON(url) {
+// -----------------------------
+// 🔍 SEARCH
+// -----------------------------
+app.get("/search", async (req, res) => {
     try {
-        const res = await fetch(url);
-        return await res.json();
-    } catch {
-        return { results: [] };
-    }
-}
+        const q = req.query.q;
+        if (!q) return res.status(400).json({ error: "Missing query" });
 
-app.get("/search", searchLimiter, async (req, res) => {
-    try {
-        const q = (req.query.q || "").trim();
-        if (!q) return res.status(400).json({ error: "Missing q" });
+        const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
+        const data = await fetch(url).then(r => r.json());
 
-        const mono = await safeJSON(`https://monochrome.tf/search/${encodeURIComponent(q)}`);
-
-        // FIX: ensure results exist and are an array
-        const results = Array.isArray(mono.results) ? mono.results : [];
-
-        const items = results.map(item => {
-            const preview = item.preview || "";
-            const format = preview.split(".").pop();
-
-            return {
-                id: item.id,
-                title: item.title,
-                artist: item.artist,
-                thumbnail: item.thumbnail,
-                preview,
-                format
-            };
-        });
-
-        res.json({ items });
+        res.json(data);
     } catch (err) {
         console.error("Search error:", err);
         res.status(500).json({ error: "Search failed" });
     }
 });
 
-
-        res.json({ items });
-    } catch (err) {
-        console.error("Search error:", err);
-        res.status(500).json({ error: "Search failed" });
-    }
-});
-
-// PLAY (Monochrome only)
-app.get("/play/:id", async (req, res) => {
+// -----------------------------
+// 🎵 TRACK STREAMS
+// -----------------------------
+app.get("/track/:id", async (req, res) => {
     try {
         const id = req.params.id;
+        const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
 
-        const mono = await safeJSON(`https://monochrome.tf/track/${id}`);
-
-        // FIX: ensure preview exists
-        if (!mono.preview) {
-            return res.status(500).json({ error: "No preview available" });
-        }
-
-        const preview = mono.preview;
-        const format = preview.split(".").pop();
-
-        res.json({
-            url: preview,
-            format
-        });
+        const data = await fetch(url).then(r => r.json());
+        res.json(data);
     } catch (err) {
-        console.error("Play error:", err);
-        res.status(500).json({ error: "Play failed" });
+        console.error("Track error:", err);
+        res.status(500).json({ error: "Track lookup failed" });
     }
 });
 
+// -----------------------------
+// 🎤 LYRICS
+// -----------------------------
+app.get("/lyrics/:id", async (req, res) => {
+    try {
+        const id = req.params.id;
+        const url = `https://yt.chocolatemoo53.com/api/v1/lyrics/${id}`;
+
+        const data = await fetch(url).then(r => r.json());
+        res.json(data);
     } catch (err) {
-        console.error("Play error:", err);
-        res.status(500).json({ error: "Play failed" });
+        console.error("Lyrics error:", err);
+        res.status(500).json({ error: "Lyrics lookup failed" });
     }
 });
 
-app.listen(PORT, HOST, () => {
-    console.log(`Monochrome-only backend with FLAC support running at http://${HOST}:${PORT}`);
+// -----------------------------
+// 🚀 START SERVER
+// -----------------------------
+app.listen(PORT, () => {
+    console.log(`Backend running on http://localhost:${PORT}`);
 });
