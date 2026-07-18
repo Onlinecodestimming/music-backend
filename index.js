@@ -51,40 +51,58 @@ app.get("/search", async (req, res) => {
 });
 
 // --------------------------------------------------
-// 🎥 VIDEO STREAM (actual video playback)
+// 🎥 VIDEO STREAM (streams + player fallback)
 // --------------------------------------------------
 app.get("/video/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        // Correct endpoint for video/audio streams
-        const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
-        const response = await fetch(url);
+        // 1️⃣ Try ChocolateMoo streams endpoint
+        const streamsUrl = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
+        let response = await fetch(streamsUrl);
 
         let data;
         try {
             data = await response.json();
         } catch {
-            return res.json({
-                id,
-                url: null,
-                error: "Invalid JSON from upstream"
-            });
+            data = {};
         }
 
-        // Try every possible video source
-        const videoUrl =
+        // Extract video/audio from streams
+        let videoUrl =
             data.videoStreams?.find(v => v.url)?.url ||
             data.videoStreams?.[0]?.url ||
             data.adaptiveFormats?.find(f => f.mimeType?.includes("video"))?.url ||
             data.formats?.find(f => f.mimeType?.includes("video"))?.url ||
             null;
 
-        // Fallback to audio if video missing
-        const audioUrl =
+        let audioUrl =
             data.audioStreams?.find(a => a.url)?.url ||
             data.audioStreams?.[0]?.url ||
             null;
+
+        // 2️⃣ If still nothing, try ChocolateMoo player endpoint
+        if (!videoUrl && !audioUrl) {
+            const playerUrl = `https://yt.chocolatemoo53.com/api/v1/player?id=${id}`;
+            const playerRes = await fetch(playerUrl);
+
+            let playerData;
+            try {
+                playerData = await playerRes.json();
+            } catch {
+                playerData = {};
+            }
+
+            videoUrl =
+                playerData.streamingData?.adaptiveFormats?.find(f => f.mimeType?.includes("video"))?.url ||
+                playerData.streamingData?.formats?.find(f => f.mimeType?.includes("video"))?.url ||
+                null;
+
+            audioUrl =
+                playerData.streamingData?.adaptiveFormats?.find(f => f.mimeType?.includes("audio"))?.url ||
+                playerData.streamingData?.formats?.find(f => f.mimeType?.includes("audio"))?.url ||
+                null;
+        }
 
         const finalUrl = videoUrl || audioUrl;
 
