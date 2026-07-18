@@ -3,14 +3,12 @@ import fetch from "node-fetch";
 import cors from "cors";
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
 
-// -----------------------------
-// 🔍 SEARCH
-// -----------------------------
+// SEARCH
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q;
@@ -26,14 +24,11 @@ app.get("/search", async (req, res) => {
     }
 });
 
-// -----------------------------
-// 🎵 TRACK STREAMS
-// -----------------------------
+// TRACK
 app.get("/track/:id", async (req, res) => {
     try {
         const id = req.params.id;
         const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
-
         const data = await fetch(url).then(r => r.json());
         res.json(data);
     } catch (err) {
@@ -42,14 +37,11 @@ app.get("/track/:id", async (req, res) => {
     }
 });
 
-// -----------------------------
-// 🎤 LYRICS
-// -----------------------------
+// LYRICS
 app.get("/lyrics/:id", async (req, res) => {
     try {
         const id = req.params.id;
         const url = `https://yt.chocolatemoo53.com/api/v1/lyrics/${id}`;
-
         const data = await fetch(url).then(r => r.json());
         res.json(data);
     } catch (err) {
@@ -58,9 +50,6 @@ app.get("/lyrics/:id", async (req, res) => {
     }
 });
 
-// -----------------------------
-// 🚀 START SERVER
-// -----------------------------
 app.listen(PORT, () => {
-    console.log(`Backend running on http://localhost:${PORT}`);
+    console.log(`Backend running on port ${PORT}`);
 });
