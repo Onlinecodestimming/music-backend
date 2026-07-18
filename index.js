@@ -1,4 +1,4 @@
-// index.js (HLS/MP3/DASH)
+// index.js
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -6,6 +6,7 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// use the client_id that works for metadata/search
 const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
 
 app.use(cors({ origin: "*", methods: ["GET"] }));
@@ -17,6 +18,48 @@ async function scFetch(url) {
     return res.json();
 }
 
+// FIXED SEARCH ENDPOINT
+app.get("/search", async (req, res) => {
+    try {
+        const q = req.query.q || "";
+        const limit = req.query.limit || "20";
+        const offset = req.query.offset || "0";
+
+        const params = new URLSearchParams({
+            q,
+            client_id: CLIENT_ID,
+            limit,
+            offset,
+            app_version: "1784221259",
+            app_locale: "en",
+            variant_ids: "core"
+        });
+
+        const url = `https://api-v2.soundcloud.com/search/tracks?${params.toString()}`;
+
+        const data = await scFetch(url);
+
+        const items = (data.collection || []).map(track => ({
+            id: track.id,
+            title: track.title,
+            artist: track.user?.username || "Unknown",
+            artwork: track.artwork_url || track.user?.avatar_url || null,
+            durationMs: track.duration
+        }));
+
+        res.json({
+            items,
+            nextOffset: Number(offset) + Number(limit),
+            raw: data
+        });
+
+    } catch (err) {
+        console.error("Search error:", err.message);
+        res.status(500).json({ error: "Search failed" });
+    }
+});
+
+// TRACK ENDPOINT WITH HLS/MP3/DASH FALLBACK
 app.get("/track/:id", async (req, res) => {
     try {
         const id = req.params.id;
@@ -45,6 +88,7 @@ app.get("/track/:id", async (req, res) => {
                 title: track.title,
                 artist: track.user?.username,
                 url: null,
+                protocol: null,
                 error: "No playable formats available"
             });
         }
@@ -61,7 +105,7 @@ app.get("/track/:id", async (req, res) => {
         });
 
     } catch (err) {
-        console.error(err);
+        console.error("Track error:", err);
         res.status(500).json({ error: "Track lookup failed" });
     }
 });
