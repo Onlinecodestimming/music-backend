@@ -11,6 +11,43 @@ app.use(express.json());
 // --------------------------------------------------
 // 🔍 SEARCH (returns { items: [...] } for your frontend)
 // --------------------------------------------------
+app.get("/search", async (req, res) => {
+    try {
+        const q = req.query.q;
+        if (!q) return res.status(400).json({ error: "Missing query" });
+
+        const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
+        let response = await fetch(url);
+
+        // Safe JSON parse
+        let data;
+        try {
+            data = await response.json();
+        } catch {
+            return res.json({ items: [] });
+        }
+
+        // Normalize to array
+        const arr = Array.isArray(data) ? data : [data];
+
+        // Convert ChocolateMoo → your frontend format
+        const items = arr.map(item => ({
+            id: item.videoId,
+            videoId: item.videoId,
+            title: item.title,
+            author: item.author
+        }));
+
+        res.json({ items });
+    } catch (err) {
+        console.error("Search error:", err);
+        res.status(500).json({ error: "Search failed" });
+    }
+});
+
+// --------------------------------------------------
+// 🎵 STREAM (your frontend calls /video/:id)
+// --------------------------------------------------
 app.get("/video/:id", async (req, res) => {
     try {
         const id = req.params.id;
@@ -18,7 +55,7 @@ app.get("/video/:id", async (req, res) => {
 
         const response = await fetch(url);
 
-        // If ChocolateMoo returns non-JSON, avoid crashing
+        // Safe JSON parse
         let data;
         try {
             data = await response.json();
@@ -60,31 +97,6 @@ app.get("/video/:id", async (req, res) => {
     }
 });
 
-
-// --------------------------------------------------
-// 🎵 STREAM (your frontend calls /video/:id)
-// --------------------------------------------------
-app.get("/video/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-        const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
-        const data = await fetch(url).then(r => r.json());
-
-        const audioUrl =
-            data.audioStreams?.find(s => s.url)?.url || null;
-
-        res.json({
-            id,
-            videoId: id,
-            url: audioUrl
-        });
-    } catch (err) {
-        console.error("Video error:", err);
-        res.status(500).json({ error: "Video lookup failed" });
-    }
-});
-
-
 // --------------------------------------------------
 // 🎤 LYRICS (optional)
 // --------------------------------------------------
@@ -92,7 +104,16 @@ app.get("/lyrics/:id", async (req, res) => {
     try {
         const id = req.params.id;
         const url = `https://yt.chocolatemoo53.com/api/v1/lyrics/${id}`;
-        const data = await fetch(url).then(r => r.json());
+
+        const response = await fetch(url);
+
+        let data;
+        try {
+            data = await response.json();
+        } catch {
+            return res.json({ error: "Invalid JSON from upstream" });
+        }
+
         res.json(data);
     } catch (err) {
         console.error("Lyrics error:", err);
