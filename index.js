@@ -6,9 +6,12 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// TODO: put your real TIDAL API base + token here
-const TIDAL_API_BASE = "https://api.tidal.com/v1";
-const TIDAL_TOKEN = process.env.TIDAL_TOKEN; // or hardcode if you want
+// ✅ your OAuth token lives ONLY here
+const TIDAL_OAUTH = process.env.TIDAL_OAUTH; // set in Railway env
+
+if (!TIDAL_OAUTH) {
+    console.warn("⚠️ TIDAL_OAUTH is not set. Set it in your env vars.");
+}
 
 app.use(cors({
     origin: "*",
@@ -18,17 +21,33 @@ app.use(cors({
 
 app.use(express.json());
 
-// 🔍 search tracks
+// helper to call TIDAL with OAuth
+async function tidalFetch(path, params = "") {
+    const base = "https://api.tidal.com/v1"; // placeholder base
+    const url = `${base}${path}${params ? `?${params}` : ""}`;
+
+    const res = await fetch(url, {
+        headers: {
+            // OAuth token stays server-side
+            Authorization: `Bearer ${TIDAL_OAUTH}`
+        }
+    });
+
+    if (!res.ok) {
+        throw new Error(`TIDAL error: ${res.status}`);
+    }
+
+    return res.json();
+}
+
+// 🔍 search tracks (you wire real endpoint)
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q;
         if (!q) return res.status(400).json({ error: "Missing query" });
 
-        // TODO: replace with real TIDAL search endpoint
-        const url = `${TIDAL_API_BASE}/search?query=${encodeURIComponent(q)}&types=TRACKS&limit=20&token=${TIDAL_TOKEN}`;
-
-        const response = await fetch(url);
-        const data = await response.json();
+        // TODO: replace params with real TIDAL search query
+        const data = await tidalFetch("/search", `query=${encodeURIComponent(q)}&types=TRACKS&limit=20`);
 
         const items = (data.tracks?.items || []).map(track => ({
             id: track.id,
@@ -40,42 +59,43 @@ app.get("/search", async (req, res) => {
 
         res.json({ items });
     } catch (err) {
-        console.error("Search error:", err);
+        console.error("Search error:", err.message);
         res.status(500).json({ error: "Search failed" });
     }
 });
 
-// 🎧 get preview URL for a track
-app.get("/preview/:id", async (req, res) => {
+// 🎧 get stream URL for a track (proxy)
+app.get("/stream/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        // TODO: replace with real TIDAL track/preview endpoint
-        const url = `${TIDAL_API_BASE}/tracks/${id}?token=${TIDAL_TOKEN}`;
+        // TODO: replace with real TIDAL track/stream endpoint
+        const track = await tidalFetch(`/tracks/${id}`, "");
 
-        const response = await fetch(url);
-        const track = await response.json();
+        // placeholder: you map whatever field TIDAL uses
+        const streamUrl = track.streamUrl || track.url || null;
 
-        // many TIDAL-like APIs expose a previewUrl field
-        const previewUrl = track.previewUrl || null;
-
-        if (!previewUrl) {
+        if (!streamUrl) {
             return res.json({
                 id,
                 url: null,
-                error: "No preview available"
+                error: "No stream available"
             });
         }
 
+        // you can either:
+        // 1) return the URL for the browser to play directly
+        // 2) proxy the audio through your server (more control)
+
         res.json({
             id,
-            url: previewUrl,
+            url: streamUrl,
             title: track.title,
             artist: track.artists?.map(a => a.name).join(", ") || "Unknown"
         });
     } catch (err) {
-        console.error("Preview error:", err);
-        res.status(500).json({ error: "Preview lookup failed" });
+        console.error("Stream error:", err.message);
+        res.status(500).json({ error: "Stream lookup failed" });
     }
 });
 
