@@ -6,7 +6,7 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Your SoundCloud client_id (public, safe to use)
+// Your SoundCloud client_id
 const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
 
 app.use(cors({ origin: "*", methods: ["GET"] }));
@@ -19,7 +19,7 @@ async function scFetch(url) {
     return res.json();
 }
 
-// 🔍 SEARCH ENDPOINT
+// 🔍 SEARCH
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q || "";
@@ -76,7 +76,7 @@ app.get("/track/:id", async (req, res) => {
     }
 });
 
-// 🎧 FULL MP3 STREAM RESOLVER (POST FIX APPLIED)
+// 🎧 FULL MP3 STREAM RESOLVER (SAFE VERSION)
 app.get("/stream/:id", async (req, res) => {
     try {
         const id = req.params.id;
@@ -96,12 +96,13 @@ app.get("/stream/:id", async (req, res) => {
             });
         }
 
-        // 2) Find progressive transcoding (MP3)
+        // 2) Find progressive transcoding
         const transcoding = (track.media?.transcodings || []).find(t =>
             t.format?.protocol === "progressive"
         );
 
         if (!transcoding) {
+            console.log("No progressive transcoding found:", track.media?.transcodings);
             return res.json({
                 id,
                 url: null,
@@ -109,20 +110,32 @@ app.get("/stream/:id", async (req, res) => {
             });
         }
 
-        // 3) Resolve transcoding → MUST BE POST
+        // 3) Resolve transcoding → POST required
         const resolveUrl = transcoding.url;
 
-        const resolved = await fetch(resolveUrl, {
+        const resolvedRes = await fetch(resolveUrl, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({ client_id: CLIENT_ID })
-        }).then(r => r.json());
+        });
+
+        if (!resolvedRes.ok) {
+            console.log("Resolve failed:", resolvedRes.status);
+            return res.json({
+                id,
+                url: null,
+                error: `Resolve failed: ${resolvedRes.status}`
+            });
+        }
+
+        const resolved = await resolvedRes.json();
 
         const mp3Url = resolved.url;
 
         if (!mp3Url) {
+            console.log("Resolved object missing URL:", resolved);
             return res.json({
                 id,
                 url: null,
@@ -139,7 +152,7 @@ app.get("/stream/:id", async (req, res) => {
         });
 
     } catch (err) {
-        console.error("Stream error:", err.message);
+        console.error("Stream error:", err);
         res.status(500).json({ error: "Stream lookup failed" });
     }
 });
