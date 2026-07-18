@@ -1,4 +1,4 @@
-// index.js (UPGRADED)
+// index.js (HLS/MP3/DASH)
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -27,7 +27,6 @@ app.get("/track/:id", async (req, res) => {
 
         const transcodings = track.media?.transcodings || [];
 
-        // priority order
         const order = [
             t => t.format?.protocol === "hls",
             t => t.format?.protocol === "progressive",
@@ -35,7 +34,6 @@ app.get("/track/:id", async (req, res) => {
         ];
 
         let chosen = null;
-
         for (const pick of order) {
             chosen = transcodings.find(pick);
             if (chosen) break;
@@ -51,7 +49,6 @@ app.get("/track/:id", async (req, res) => {
             });
         }
 
-        // resolve transcoding
         const resolveUrl = chosen.url + `?client_id=${CLIENT_ID}`;
         const resolved = await fetch(resolveUrl).then(r => r.json());
 
