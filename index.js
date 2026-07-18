@@ -28,6 +28,7 @@ app.get("/search", async (req, res) => {
 });
 
 
+
 // LYRICS
 app.get("/lyrics/:id", async (req, res) => {
     try {
