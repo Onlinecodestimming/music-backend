@@ -6,43 +6,40 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Your SoundCloud client_id
+// use the client_id that works for /tracks + /search
 const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
 
 app.use(cors({ origin: "*", methods: ["GET"] }));
 app.use(express.json());
 
-// Helper: GET JSON
 async function scFetch(url) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`SoundCloud error: ${res.status}`);
     return res.json();
 }
 
-// 🔍 SEARCH
+// 🔍 search tracks
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q || "";
 
         const url =
-            "https://api-v2.soundcloud.com/search?" +
+            "https://api-v2.soundcloud.com/search/tracks?" +
             new URLSearchParams({
                 q,
                 client_id: CLIENT_ID,
-                limit: "30"
+                limit: "20"
             }).toString();
 
         const data = await scFetch(url);
 
-        const items = (data.collection || [])
-            .filter(item => item.kind === "track")
-            .map(track => ({
-                id: track.id,
-                title: track.title,
-                artist: track.user?.username || "Unknown",
-                artwork: track.artwork_url || track.user?.avatar_url || null,
-                durationMs: track.duration
-            }));
+        const items = (data.collection || []).map(track => ({
+            id: track.id,
+            title: track.title,
+            artist: track.user?.username || "Unknown",
+            artwork: track.artwork_url || track.user?.avatar_url || null,
+            durationMs: track.duration
+        }));
 
         res.json({ items });
     } catch (err) {
@@ -51,7 +48,7 @@ app.get("/search", async (req, res) => {
     }
 });
 
-// 🎧 TRACK METADATA
+// 🎧 track + HLS URL
 app.get("/track/:id", async (req, res) => {
     try {
         const id = req.params.id;
@@ -62,101 +59,39 @@ app.get("/track/:id", async (req, res) => {
 
         const track = await scFetch(url);
 
+        const transcodings = track.media?.transcodings || [];
+
+        // prefer HLS
+        const hls = transcodings.find(t => t.format?.protocol === "hls");
+
+        let hlsUrl = null;
+
+        if (hls) {
+            // this URL usually returns a JSON with the final playlist.m3u8
+            const resolveRes = await fetch(hls.url + "?" + new URLSearchParams({
+                client_id: CLIENT_ID
+            }).toString());
+
+            if (resolveRes.ok) {
+                const resolved = await resolveRes.json();
+                hlsUrl = resolved.url || null;
+            }
+        }
+
         res.json({
             id: track.id,
             title: track.title,
             artist: track.user?.username || "Unknown",
             artwork: track.artwork_url || track.user?.avatar_url || null,
             durationMs: track.duration,
-            streamable: track.streamable
+            hlsUrl
         });
     } catch (err) {
-        console.error("Track error:", err.message);
+        console.error("Track error:", err);
         res.status(500).json({ error: "Track lookup failed" });
     }
 });
 
-// 🎧 FULL MP3 STREAM RESOLVER (SAFE VERSION)
-app.get("/stream/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-
-        // 1) Fetch track metadata
-        const trackUrl =
-            `https://api-v2.soundcloud.com/tracks/${id}?` +
-            new URLSearchParams({ client_id: CLIENT_ID }).toString();
-
-        const track = await scFetch(trackUrl);
-
-        if (!track.streamable) {
-            return res.json({
-                id,
-                url: null,
-                error: "Track is not streamable"
-            });
-        }
-
-        // 2) Find progressive transcoding
-        const transcoding = (track.media?.transcodings || []).find(t =>
-            t.format?.protocol === "progressive"
-        );
-
-        if (!transcoding) {
-            console.log("No progressive transcoding found:", track.media?.transcodings);
-            return res.json({
-                id,
-                url: null,
-                error: "No progressive stream available"
-            });
-        }
-
-        // 3) Resolve transcoding → POST required
-        const resolveUrl = transcoding.url;
-
-        const resolvedRes = await fetch(resolveUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({ client_id: CLIENT_ID })
-        });
-
-        if (!resolvedRes.ok) {
-            console.log("Resolve failed:", resolvedRes.status);
-            return res.json({
-                id,
-                url: null,
-                error: `Resolve failed: ${resolvedRes.status}`
-            });
-        }
-
-        const resolved = await resolvedRes.json();
-
-        const mp3Url = resolved.url;
-
-        if (!mp3Url) {
-            console.log("Resolved object missing URL:", resolved);
-            return res.json({
-                id,
-                url: null,
-                error: "No stream URL returned"
-            });
-        }
-
-        // 4) Return final MP3 URL
-        res.json({
-            id,
-            url: mp3Url,
-            title: track.title,
-            artist: track.user?.username || "Unknown"
-        });
-
-    } catch (err) {
-        console.error("Stream error:", err);
-        res.status(500).json({ error: "Stream lookup failed" });
-    }
-});
-
 app.listen(PORT, () => {
-    console.log(`SoundCloud backend running on port ${PORT}`);
+    console.log(`HLS SoundCloud backend running on port ${PORT}`);
 });
