@@ -6,8 +6,8 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(cors({
-    origin: "*",
-    methods: ["GET"],
+    origin: "https://listen.gt.tc",
+    methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type"]
 }));
 app.use(express.json());
