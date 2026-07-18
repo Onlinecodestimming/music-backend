@@ -6,7 +6,6 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// your OAuth token from Railway Variables
 const TIDAL_OAUTH = process.env.TIDAL_OAUTH;
 
 if (!TIDAL_OAUTH) {
@@ -21,15 +20,15 @@ app.use(cors({
 
 app.use(express.json());
 
-// helper: call TIDAL API with your OAuth
+// generic helper for TIDAL v2
 async function tidalFetch(path, params = "") {
-    // TODO: replace with the real base URL you see in DevTools
-    const base = "https://api.tidal.com/v1";
+    const base = "https://tidal.com/v2";
     const url = `${base}${path}${params ? `?${params}` : ""}`;
 
     const res = await fetch(url, {
         headers: {
-            Authorization: TIDAL_OAUTH
+            Authorization: TIDAL_OAUTH,
+            Accept: "application/json"
         }
     });
 
@@ -40,19 +39,28 @@ async function tidalFetch(path, params = "") {
     return res.json();
 }
 
-// 🔍 search tracks
+// 🔍 search tracks using your captured request pattern
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q;
         if (!q) return res.status(400).json({ error: "Missing query" });
 
-        // TODO: adjust params to match the real search endpoint you see
-        const data = await tidalFetch(
-            "/search",
-            `query=${encodeURIComponent(q)}&types=TRACKS&limit=20`
-        );
+        const params = new URLSearchParams({
+            includeContributors: "true",
+            includeDidYouMean: "true",
+            includeUserPlaylists: "true",
+            limit: "50",
+            query: q,
+            supportsUserData: "true",
+            types: "ARTISTS,ALBUMS,TRACKS,VIDEOS,PLAYLISTS,UPLOADS",
+            countryCode: "US",
+            locale: "en_US",
+            deviceType: "BROWSER"
+        }).toString();
 
-        const items = (data.tracks?.items || []).map(track => ({
+        const data = await tidalFetch("/search/", params);
+
+        const items = (data?.tracks?.items || []).map(track => ({
             id: track.id,
             title: track.title,
             artist: track.artists?.map(a => a.name).join(", ") || "Unknown",
@@ -67,15 +75,24 @@ app.get("/search", async (req, res) => {
     }
 });
 
-// 🎧 get stream URL for a track
+// 🎧 placeholder stream endpoint – you’ll wire this once you capture a play request
 app.get("/stream/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        // TODO: replace with the real track/stream endpoint you see in DevTools
-        const track = await tidalFetch(`/tracks/${id}`, "");
+        // TODO: capture the real playback request from DevTools (like you did for search)
+        // and mirror its path + params here.
+        //
+        // Example shape (you will replace with the real one):
+        // const params = new URLSearchParams({
+        //   countryCode: "US",
+        //   deviceType: "BROWSER"
+        // }).toString();
+        //
+        // const track = await tidalFetch(`/tracks/${id}`, params);
 
-        // TODO: map the actual field that contains the stream URL
+        const track = {}; // placeholder until you grab the real endpoint
+
         const streamUrl =
             track.streamUrl ||
             track.url ||
