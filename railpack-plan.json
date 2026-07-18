@@ -1,3 +1,14 @@
 {
-  "appDirectory": "."
+  "schemaVersion": 1,
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "node index.js",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  },
+  "env": {
+    "PORT": "8080"
+  }
 }
