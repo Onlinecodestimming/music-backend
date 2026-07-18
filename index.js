@@ -6,7 +6,7 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// use the client_id that works for metadata/search
+// Your working SoundCloud client_id
 const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
 
 app.use(cors({ origin: "*", methods: ["GET"] }));
@@ -14,11 +14,17 @@ app.use(express.json());
 
 async function scFetch(url) {
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`SoundCloud error: ${res.status}`);
+
+    // If SoundCloud returns HTML or error, throw
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`SoundCloud error ${res.status}: ${text}`);
+    }
+
     return res.json();
 }
 
-// FIXED SEARCH ENDPOINT
+// ⭐ FIXED SEARCH ENDPOINT
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q || "";
@@ -26,18 +32,27 @@ app.get("/search", async (req, res) => {
         const offset = req.query.offset || "0";
 
         const params = new URLSearchParams({
-    q,
-    client_id: CLIENT_ID,
-    limit,
-    offset,
-    app_version: "1784221259",
-    app_locale: "en",
-    variant_ids: "core"
-});
+            q,
+            client_id: CLIENT_ID,
+            limit,
+            offset,
+            app_version: "1784221259",
+            app_locale: "en",
+            variant_ids: "core"
+        });
 
         const url = `https://api-v2.soundcloud.com/search/tracks?${params.toString()}`;
 
-        const data = await scFetch(url);
+        let data;
+        try {
+            data = await scFetch(url);
+        } catch (err) {
+            console.error("SoundCloud rejected search:", err.message);
+            return res.status(502).json({
+                error: "SoundCloud search failed",
+                details: err.message
+            });
+        }
 
         const items = (data.collection || []).map(track => ({
             id: track.id,
@@ -49,17 +64,16 @@ app.get("/search", async (req, res) => {
 
         res.json({
             items,
-            nextOffset: Number(offset) + Number(limit),
-            raw: data
+            nextOffset: Number(offset) + Number(limit)
         });
 
     } catch (err) {
-        console.error("Search error:", err.message);
-        res.status(500).json({ error: "Search failed" });
+        console.error("Search endpoint crashed:", err);
+        res.status(500).json({ error: "Internal server error" });
     }
 });
 
-// TRACK ENDPOINT WITH HLS/MP3/DASH FALLBACK
+// ⭐ TRACK RESOLVER WITH HLS → MP3 → DASH FALLBACK
 app.get("/track/:id", async (req, res) => {
     try {
         const id = req.params.id;
@@ -111,5 +125,5 @@ app.get("/track/:id", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`HLS/MP3/DASH SoundCloud backend running on port ${PORT}`);
+    console.log(`Backend running on port ${PORT}`);
 });
