@@ -1,3 +1,37 @@
+// index.js
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// Your working SoundCloud client_id
+const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
+
+app.use(cors({ origin: "*", methods: ["GET"] }));
+app.use(express.json());
+
+// Safe fetch wrapper
+async function scFetch(url) {
+    const res = await fetch(url);
+    const raw = await res.text();
+
+    // HTML = Cloudflare / SoundCloud error page
+    if (raw.trim().startsWith("<")) {
+        throw new Error("SoundCloud returned HTML instead of JSON");
+    }
+
+    try {
+        return JSON.parse(raw);
+    } catch {
+        throw new Error("SoundCloud returned invalid JSON");
+    }
+}
+
+/* -------------------------------------------------------
+   SEARCH ENDPOINT (CRASH-PROOF)
+------------------------------------------------------- */
 app.get("/search", async (req, res) => {
     const q = req.query.q || "";
     const limit = req.query.limit || "20";
@@ -16,41 +50,8 @@ app.get("/search", async (req, res) => {
     const url = `https://api-v2.soundcloud.com/search/tracks?${params.toString()}`;
 
     try {
-        const scRes = await fetch(url);
+        const data = await scFetch(url);
 
-        // Read raw text ALWAYS
-        const raw = await scRes.text();
-
-        // If SoundCloud returned HTML → fail gracefully
-        if (raw.trim().startsWith("<")) {
-            console.error("HTML returned from SoundCloud search");
-            return res.status(502).json({
-                error: "SoundCloud returned HTML instead of JSON",
-                snippet: raw.substring(0, 300)
-            });
-        }
-
-        // Try JSON parsing safely
-        let data;
-        try {
-            data = JSON.parse(raw);
-        } catch (err) {
-            console.error("JSON parse failed:", err);
-            return res.status(502).json({
-                error: "SoundCloud returned invalid JSON",
-                snippet: raw.substring(0, 300)
-            });
-        }
-
-        // If SoundCloud returned an error JSON
-        if (!data || typeof data !== "object") {
-            return res.status(502).json({
-                error: "Unexpected SoundCloud response",
-                snippet: raw.substring(0, 300)
-            });
-        }
-
-        // Normalize results
         const items = Array.isArray(data.collection)
             ? data.collection.map(track => ({
                   id: track.id,
@@ -67,10 +68,73 @@ app.get("/search", async (req, res) => {
         });
 
     } catch (err) {
-        console.error("Search crashed:", err);
-        return res.status(500).json({
-            error: "Internal server error",
+        console.error("Search error:", err.message);
+        return res.status(502).json({
+            error: "SoundCloud search failed",
             details: err.message
         });
     }
+});
+
+/* -------------------------------------------------------
+   TRACK RESOLVER (HLS → MP3 → DASH fallback)
+------------------------------------------------------- */
+app.get("/track/:id", async (req, res) => {
+    try {
+        const id = req.params.id;
+
+        const track = await scFetch(
+            `https://api-v2.soundcloud.com/tracks/${id}?client_id=${CLIENT_ID}`
+        );
+
+        const transcodings = track.media?.transcodings || [];
+
+        const order = [
+            t => t.format?.protocol === "hls",
+            t => t.format?.protocol === "progressive",
+            t => t.format?.protocol === "dash"
+        ];
+
+        let chosen = null;
+        for (const pick of order) {
+            chosen = transcodings.find(pick);
+            if (chosen) break;
+        }
+
+        if (!chosen) {
+            return res.json({
+                id,
+                title: track.title,
+                artist: track.user?.username,
+                url: null,
+                protocol: null,
+                error: "No playable formats available"
+            });
+        }
+
+        const resolveUrl = chosen.url + `?client_id=${CLIENT_ID}`;
+        const resolved = await scFetch(resolveUrl);
+
+        return res.json({
+            id,
+            title: track.title,
+            artist: track.user?.username,
+            url: resolved.url,
+            protocol: chosen.format.protocol
+        });
+
+    } catch (err) {
+        console.error("Track error:", err.message);
+        return res.status(502).json({
+            error: "Track lookup failed",
+            details: err.message
+        });
+    }
+});
+
+/* -------------------------------------------------------
+   START SERVER
+------------------------------------------------------- */
+app.listen(PORT, () => {
+    console.log(`Backend running on port ${PORT}`);
 });
