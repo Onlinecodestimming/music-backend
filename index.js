@@ -57,8 +57,8 @@ app.get("/video/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        // Use the correct ChocolateMoo endpoint for video
-        const url = `https://yt.chocolatemoo53.com/api/v1/videos/${id}`;
+        // Correct endpoint for video/audio streams
+        const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
         const response = await fetch(url);
 
         let data;
@@ -67,19 +67,20 @@ app.get("/video/:id", async (req, res) => {
         } catch {
             return res.json({
                 id,
-                videoId: id,
                 url: null,
                 error: "Invalid JSON from upstream"
             });
         }
 
-        // Try to get a real video stream first
+        // Try every possible video source
         const videoUrl =
             data.videoStreams?.find(v => v.url)?.url ||
             data.videoStreams?.[0]?.url ||
+            data.adaptiveFormats?.find(f => f.mimeType?.includes("video"))?.url ||
+            data.formats?.find(f => f.mimeType?.includes("video"))?.url ||
             null;
 
-        // Fallback to audio if video is missing
+        // Fallback to audio if video missing
         const audioUrl =
             data.audioStreams?.find(a => a.url)?.url ||
             data.audioStreams?.[0]?.url ||
@@ -90,15 +91,13 @@ app.get("/video/:id", async (req, res) => {
         if (!finalUrl) {
             return res.json({
                 id,
-                videoId: id,
                 url: null,
-                error: "No video or audio stream found"
+                error: "No video stream found"
             });
         }
 
         res.json({
             id,
-            videoId: id,
             url: finalUrl
         });
 
