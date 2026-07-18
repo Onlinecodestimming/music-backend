@@ -1,95 +1,71 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>SoundCloud HLS/MP3/DASH Player</title>
+// index.js (HLS/MP3/DASH)
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
 
-    <!-- HLS.js for HLS playback -->
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+const app = express();
+const PORT = process.env.PORT || 8080;
 
-    <!-- DASH.js for MPEG-DASH playback (correct URL) -->
-    <script src="https://cdn.jsdelivr.net/npm/dashjs@latest/dist/dash.all.min.js"></script>
+const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
 
-    <!-- Your frontend logic -->
-    <script defer src="frontend.js"></script>
+app.use(cors({ origin: "*", methods: ["GET"] }));
+app.use(express.json());
 
-    <style>
-        body {
-            background: #111;
-            color: #fff;
-            font-family: Arial, sans-serif;
-            padding: 20px;
+async function scFetch(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`SoundCloud error: ${res.status}`);
+    return res.json();
+}
+
+app.get("/track/:id", async (req, res) => {
+    try {
+        const id = req.params.id;
+
+        const track = await scFetch(
+            `https://api-v2.soundcloud.com/tracks/${id}?client_id=${CLIENT_ID}`
+        );
+
+        const transcodings = track.media?.transcodings || [];
+
+        const order = [
+            t => t.format?.protocol === "hls",
+            t => t.format?.protocol === "progressive",
+            t => t.format?.protocol === "dash"
+        ];
+
+        let chosen = null;
+        for (const pick of order) {
+            chosen = transcodings.find(pick);
+            if (chosen) break;
         }
 
-        h1 {
-            margin-bottom: 10px;
+        if (!chosen) {
+            return res.json({
+                id,
+                title: track.title,
+                artist: track.user?.username,
+                url: null,
+                error: "No playable formats available"
+            });
         }
 
-        #searchBox {
-            width: 300px;
-            padding: 10px;
-            font-size: 16px;
-            border-radius: 4px;
-            border: none;
-            outline: none;
-        }
+        const resolveUrl = chosen.url + `?client_id=${CLIENT_ID}`;
+        const resolved = await fetch(resolveUrl).then(r => r.json());
 
-        #searchBtn {
-            padding: 10px 16px;
-            margin-left: 8px;
-            background: #ff5500;
-            border: none;
-            border-radius: 4px;
-            color: #fff;
-            font-size: 16px;
-            cursor: pointer;
-        }
+        res.json({
+            id,
+            title: track.title,
+            artist: track.user?.username,
+            url: resolved.url,
+            protocol: chosen.format.protocol
+        });
 
-        #searchBtn:hover {
-            background: #ff3300;
-        }
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Track lookup failed" });
+    }
+});
 
-        #results {
-            margin-top: 20px;
-        }
-
-        .track {
-            padding: 10px 0;
-            border-bottom: 1px solid #333;
-            cursor: pointer;
-        }
-
-        .track:hover {
-            background: #222;
-        }
-
-        #nowPlaying {
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 2px solid #444;
-        }
-
-        audio {
-            width: 100%;
-            margin-top: 10px;
-        }
-    </style>
-</head>
-
-<body>
-
-    <h1>SoundCloud Player (HLS + MP3 + DASH)</h1>
-
-    <input id="searchBox" placeholder="Search tracks..." />
-    <button id="searchBtn">Search</button>
-
-    <div id="results"></div>
-
-    <div id="nowPlaying">
-        <h2 id="npTitle"></h2>
-        <p id="npArtist"></p>
-        <audio id="player" controls></audio>
-    </div>
-
-</body>
-</html>
+app.listen(PORT, () => {
+    console.log(`HLS/MP3/DASH SoundCloud backend running on port ${PORT}`);
+});
