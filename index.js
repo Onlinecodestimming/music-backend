@@ -19,7 +19,6 @@ app.get("/search", async (req, res) => {
         const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
         let response = await fetch(url);
 
-        // Safe JSON parse
         let data;
         try {
             data = await response.json();
@@ -27,10 +26,8 @@ app.get("/search", async (req, res) => {
             return res.json({ items: [] });
         }
 
-        // Normalize to array
         const arr = Array.isArray(data) ? data : [data];
 
-        // Convert ChocolateMoo → your frontend format
         const items = arr.map(item => ({
             id: item.videoId,
             videoId: item.videoId,
@@ -55,7 +52,6 @@ app.get("/video/:id", async (req, res) => {
 
         const response = await fetch(url);
 
-        // Safe JSON parse
         let data;
         try {
             data = await response.json();
@@ -68,12 +64,12 @@ app.get("/video/:id", async (req, res) => {
             });
         }
 
-        // Try every possible ChocolateMoo audio format
+        // Fallback audio extraction
         const audioUrl =
             data.audioStreams?.find(s => s.url)?.url ||
             data.audioStreams?.[0]?.url ||
             data.audio?.[0]?.url ||
-            data.formats?.find(f => f.mimeType?.includes("audio"))?.url ||
+            (data.formats || []).find(f => f.mimeType?.includes("audio"))?.url ||
             null;
 
         if (!audioUrl) {
@@ -98,7 +94,7 @@ app.get("/video/:id", async (req, res) => {
 });
 
 // --------------------------------------------------
-// 🎤 LYRICS (optional)
+// 🎤 LYRICS
 // --------------------------------------------------
 app.get("/lyrics/:id", async (req, res) => {
     try {
