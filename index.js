@@ -1,13 +1,15 @@
+// index.js
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// --------------------------------------------------
-// ✅ FIXED CORS (Railway-compatible)
-// --------------------------------------------------
+// TODO: put your real TIDAL API base + token here
+const TIDAL_API_BASE = "https://api.tidal.com/v1";
+const TIDAL_TOKEN = process.env.TIDAL_TOKEN; // or hardcode if you want
+
 app.use(cors({
     origin: "*",
     methods: ["GET"],
@@ -16,31 +18,24 @@ app.use(cors({
 
 app.use(express.json());
 
-// --------------------------------------------------
-// 🔍 SEARCH (returns { items: [...] } for your frontend)
-// --------------------------------------------------
+// 🔍 search tracks
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q;
         if (!q) return res.status(400).json({ error: "Missing query" });
 
-        const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
+        // TODO: replace with real TIDAL search endpoint
+        const url = `${TIDAL_API_BASE}/search?query=${encodeURIComponent(q)}&types=TRACKS&limit=20&token=${TIDAL_TOKEN}`;
+
         const response = await fetch(url);
+        const data = await response.json();
 
-        let data;
-        try {
-            data = await response.json();
-        } catch {
-            return res.json({ items: [] });
-        }
-
-        const arr = Array.isArray(data) ? data : [data];
-
-        const items = arr.map(item => ({
-            id: item.videoId,
-            videoId: item.videoId,
-            title: item.title,
-            author: item.author
+        const items = (data.tracks?.items || []).map(track => ({
+            id: track.id,
+            title: track.title,
+            artist: track.artists?.map(a => a.name).join(", ") || "Unknown",
+            album: track.album?.title || "",
+            cover: track.album?.cover || null
         }));
 
         res.json({ items });
@@ -50,108 +45,40 @@ app.get("/search", async (req, res) => {
     }
 });
 
-// --------------------------------------------------
-// 🎥 VIDEO STREAM (streams + player fallback)
-// --------------------------------------------------
-app.get("/video/:id", async (req, res) => {
+// 🎧 get preview URL for a track
+app.get("/preview/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        // 1️⃣ Try ChocolateMoo streams endpoint
-        const streamsUrl = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
-        let response = await fetch(streamsUrl);
+        // TODO: replace with real TIDAL track/preview endpoint
+        const url = `${TIDAL_API_BASE}/tracks/${id}?token=${TIDAL_TOKEN}`;
 
-        let data;
-        try {
-            data = await response.json();
-        } catch {
-            data = {};
-        }
+        const response = await fetch(url);
+        const track = await response.json();
 
-        // Extract video/audio from streams
-        let videoUrl =
-            data.videoStreams?.find(v => v.url)?.url ||
-            data.videoStreams?.[0]?.url ||
-            data.adaptiveFormats?.find(f => f.mimeType?.includes("video"))?.url ||
-            data.formats?.find(f => f.mimeType?.includes("video"))?.url ||
-            null;
+        // many TIDAL-like APIs expose a previewUrl field
+        const previewUrl = track.previewUrl || null;
 
-        let audioUrl =
-            data.audioStreams?.find(a => a.url)?.url ||
-            data.audioStreams?.[0]?.url ||
-            null;
-
-        // 2️⃣ If still nothing, try ChocolateMoo player endpoint
-        if (!videoUrl && !audioUrl) {
-            const playerUrl = `https://yt.chocolatemoo53.com/api/v1/player?id=${id}`;
-            const playerRes = await fetch(playerUrl);
-
-            let playerData;
-            try {
-                playerData = await playerRes.json();
-            } catch {
-                playerData = {};
-            }
-
-            videoUrl =
-                playerData.streamingData?.adaptiveFormats?.find(f => f.mimeType?.includes("video"))?.url ||
-                playerData.streamingData?.formats?.find(f => f.mimeType?.includes("video"))?.url ||
-                null;
-
-            audioUrl =
-                playerData.streamingData?.adaptiveFormats?.find(f => f.mimeType?.includes("audio"))?.url ||
-                playerData.streamingData?.formats?.find(f => f.mimeType?.includes("audio"))?.url ||
-                null;
-        }
-
-        const finalUrl = videoUrl || audioUrl;
-
-        if (!finalUrl) {
+        if (!previewUrl) {
             return res.json({
                 id,
                 url: null,
-                error: "No video stream found"
+                error: "No preview available"
             });
         }
 
         res.json({
             id,
-            url: finalUrl
+            url: previewUrl,
+            title: track.title,
+            artist: track.artists?.map(a => a.name).join(", ") || "Unknown"
         });
-
     } catch (err) {
-        console.error("Video error:", err);
-        res.status(500).json({ error: "Video lookup failed" });
+        console.error("Preview error:", err);
+        res.status(500).json({ error: "Preview lookup failed" });
     }
 });
 
-// --------------------------------------------------
-// 🎤 LYRICS (optional)
-// --------------------------------------------------
-app.get("/lyrics/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-        const url = `https://yt.chocolatemoo53.com/api/v1/lyrics/${id}`;
-
-        const response = await fetch(url);
-
-        let data;
-        try {
-            data = await response.json();
-        } catch {
-            return res.json({ error: "Invalid JSON from upstream" });
-        }
-
-        res.json(data);
-    } catch (err) {
-        console.error("Lyrics error:", err);
-        res.status(500).json({ error: "Lyrics lookup failed" });
-    }
-});
-
-// --------------------------------------------------
-// 🚀 START SERVER
-// --------------------------------------------------
 app.listen(PORT, () => {
     console.log(`Backend running on port ${PORT}`);
 });
