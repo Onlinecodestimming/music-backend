@@ -17,25 +17,16 @@ app.get("/search", async (req, res) => {
         const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
         const data = await fetch(url).then(r => r.json());
 
-        res.json(data);
+        // Always return an array so frontend forEach never breaks
+        const safe = Array.isArray(data) ? data : [data];
+
+        res.json(safe);
     } catch (err) {
         console.error("Search error:", err);
         res.status(500).json({ error: "Search failed" });
     }
 });
 
-// TRACK
-app.get("/track/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
-        const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
-        const data = await fetch(url).then(r => r.json());
-        res.json(data);
-    } catch (err) {
-        console.error("Track error:", err);
-        res.status(500).json({ error: "Track lookup failed" });
-    }
-});
 
 // LYRICS
 app.get("/lyrics/:id", async (req, res) => {
