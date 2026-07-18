@@ -5,11 +5,15 @@ import cors from "cors";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// --------------------------------------------------
+// ✅ FIXED CORS (Railway-compatible)
+// --------------------------------------------------
 app.use(cors({
-    origin: "https://listen.gt.tc",
-    methods: ["GET", "POST"],
+    origin: "*",
+    methods: ["GET"],
     allowedHeaders: ["Content-Type"]
 }));
+
 app.use(express.json());
 
 // --------------------------------------------------
@@ -21,7 +25,7 @@ app.get("/search", async (req, res) => {
         if (!q) return res.status(400).json({ error: "Missing query" });
 
         const url = `https://yt.chocolatemoo53.com/api/v1/search?q=${encodeURIComponent(q)}&type=video`;
-        let response = await fetch(url);
+        const response = await fetch(url);
 
         let data;
         try {
@@ -47,13 +51,14 @@ app.get("/search", async (req, res) => {
 });
 
 // --------------------------------------------------
-// 🎵 STREAM (your frontend calls /video/:id)
+// 🎥 VIDEO STREAM (actual video playback)
 // --------------------------------------------------
 app.get("/video/:id", async (req, res) => {
     try {
         const id = req.params.id;
-        const url = `https://yt.chocolatemoo53.com/api/v1/videos/${id}`;
 
+        // Use the correct ChocolateMoo endpoint for video
+        const url = `https://yt.chocolatemoo53.com/api/v1/videos/${id}`;
         const response = await fetch(url);
 
         let data;
@@ -68,7 +73,7 @@ app.get("/video/:id", async (req, res) => {
             });
         }
 
-        // Try to get a real video stream
+        // Try to get a real video stream first
         const videoUrl =
             data.videoStreams?.find(v => v.url)?.url ||
             data.videoStreams?.[0]?.url ||
@@ -103,37 +108,8 @@ app.get("/video/:id", async (req, res) => {
     }
 });
 
-        // Fallback audio extraction
-        const audioUrl =
-            data.audioStreams?.find(s => s.url)?.url ||
-            data.audioStreams?.[0]?.url ||
-            data.audio?.[0]?.url ||
-            (data.formats || []).find(f => f.mimeType?.includes("audio"))?.url ||
-            null;
-
-        if (!audioUrl) {
-            return res.json({
-                id,
-                videoId: id,
-                url: null,
-                error: "No audio stream found"
-            });
-        }
-
-        res.json({
-            id,
-            videoId: id,
-            url: audioUrl
-        });
-
-    } catch (err) {
-        console.error("Video error:", err);
-        res.status(500).json({ error: "Video lookup failed" });
-    }
-});
-
 // --------------------------------------------------
-// 🎤 LYRICS
+// 🎤 LYRICS (optional)
 // --------------------------------------------------
 app.get("/lyrics/:id", async (req, res) => {
     try {
