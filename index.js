@@ -6,135 +6,71 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Your working SoundCloud client_id
-const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
+const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI; // e.g. https://your-domain.com/callback
 
-app.use(cors({ origin: "*", methods: ["GET"] }));
+app.use(cors({ origin: "*" }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Safe fetch wrapper
-async function scFetch(url) {
-    const res = await fetch(url);
-    const raw = await res.text();
-
-    // HTML = Cloudflare / SoundCloud error page
-    if (raw.trim().startsWith("<")) {
-        throw new Error("SoundCloud returned HTML instead of JSON");
-    }
-
-    try {
-        return JSON.parse(raw);
-    } catch {
-        throw new Error("SoundCloud returned invalid JSON");
-    }
-}
-
-/* -------------------------------------------------------
-   SEARCH ENDPOINT (CRASH-PROOF)
-------------------------------------------------------- */
-app.get("/search", async (req, res) => {
-    const q = req.query.q || "";
-    const limit = req.query.limit || "20";
-    const offset = req.query.offset || "0";
+// 1. Login URL (user clicks this)
+app.get("/login", (req, res) => {
+    const scope = [
+        "streaming",
+        "user-read-email",
+        "user-read-private",
+        "user-read-playback-state",
+        "user-modify-playback-state"
+    ].join(" ");
 
     const params = new URLSearchParams({
-        q,
         client_id: CLIENT_ID,
-        limit,
-        offset,
-        app_version: "1784221259",
-        app_locale: "en",
-        variant_ids: "core"
+        response_type: "code",
+        redirect_uri: REDIRECT_URI,
+        scope
     });
 
-    const url = `https://api-v2.soundcloud.com/search/tracks?${params.toString()}`;
-
-    try {
-        const data = await scFetch(url);
-
-        const items = Array.isArray(data.collection)
-            ? data.collection.map(track => ({
-                  id: track.id,
-                  title: track.title,
-                  artist: track.user?.username || "Unknown",
-                  artwork: track.artwork_url || track.user?.avatar_url || null,
-                  durationMs: track.duration
-              }))
-            : [];
-
-        return res.json({
-            items,
-            nextOffset: Number(offset) + Number(limit)
-        });
-
-    } catch (err) {
-        console.error("Search error:", err.message);
-        return res.status(502).json({
-            error: "SoundCloud search failed",
-            details: err.message
-        });
-    }
+    res.redirect("https://accounts.spotify.com/authorize?" + params.toString());
 });
 
-/* -------------------------------------------------------
-   TRACK RESOLVER (HLS → MP3 → DASH fallback)
-------------------------------------------------------- */
-app.get("/track/:id", async (req, res) => {
-    try {
-        const id = req.params.id;
+// 2. Callback (Spotify redirects here with ?code=)
+app.get("/callback", async (req, res) => {
+    const code = req.query.code;
+    if (!code) return res.status(400).send("No code");
 
-        const track = await scFetch(
-            `https://api-v2.soundcloud.com/tracks/${id}?client_id=${CLIENT_ID}`
-        );
+    const auth = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
-        const transcodings = track.media?.transcodings || [];
+    const tokenRes = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+            Authorization: `Basic ${auth}`,
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: REDIRECT_URI
+        }).toString()
+    });
 
-        const order = [
-            t => t.format?.protocol === "hls",
-            t => t.format?.protocol === "progressive",
-            t => t.format?.protocol === "dash"
-        ];
+    const data = await tokenRes.json();
 
-        let chosen = null;
-        for (const pick of order) {
-            chosen = transcodings.find(pick);
-            if (chosen) break;
-        }
-
-        if (!chosen) {
-            return res.json({
-                id,
-                title: track.title,
-                artist: track.user?.username,
-                url: null,
-                protocol: null,
-                error: "No playable formats available"
-            });
-        }
-
-        const resolveUrl = chosen.url + `?client_id=${CLIENT_ID}`;
-        const resolved = await scFetch(resolveUrl);
-
-        return res.json({
-            id,
-            title: track.title,
-            artist: track.user?.username,
-            url: resolved.url,
-            protocol: chosen.format.protocol
-        });
-
-    } catch (err) {
-        console.error("Track error:", err.message);
-        return res.status(502).json({
-            error: "Track lookup failed",
-            details: err.message
-        });
-    }
+    // In a real app, store tokens in DB/session.
+    // For now, just send them to frontend as JSON.
+    return res.send(`
+        <script>
+            window.opener.postMessage(${JSON.stringify(data)}, "*");
+            window.close();
+        </script>
+    `);
 });
 
-/* -------------------------------------------------------
-   START SERVER
-------------------------------------------------------- */
+// 3. Simple health check
+app.get("/", (req, res) => {
+    res.send("Spotify Connect backend running");
+});
+
 app.listen(PORT, () => {
-    console.log(`Backend running on port ${PORT}`);
+    console.log(`Backend on ${PORT}`);
 });
