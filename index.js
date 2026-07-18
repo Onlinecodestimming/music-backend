@@ -10,7 +10,6 @@ app.use(cors({
     methods: ["GET"],
     allowedHeaders: ["Content-Type"]
 }));
-
 app.use(express.json());
 
 // --------------------------------------------------
