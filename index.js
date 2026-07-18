@@ -48,7 +48,7 @@ app.get("/search", async (req, res) => {
 app.get("/video/:id", async (req, res) => {
     try {
         const id = req.params.id;
-        const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
+        const url = `https://yt.chocolatemoo53.com/api/v1/videos/${id}`;
 
         const response = await fetch(url);
 
@@ -63,6 +63,41 @@ app.get("/video/:id", async (req, res) => {
                 error: "Invalid JSON from upstream"
             });
         }
+
+        // Try to get a real video stream
+        const videoUrl =
+            data.videoStreams?.find(v => v.url)?.url ||
+            data.videoStreams?.[0]?.url ||
+            null;
+
+        // Fallback to audio if video is missing
+        const audioUrl =
+            data.audioStreams?.find(a => a.url)?.url ||
+            data.audioStreams?.[0]?.url ||
+            null;
+
+        const finalUrl = videoUrl || audioUrl;
+
+        if (!finalUrl) {
+            return res.json({
+                id,
+                videoId: id,
+                url: null,
+                error: "No video or audio stream found"
+            });
+        }
+
+        res.json({
+            id,
+            videoId: id,
+            url: finalUrl
+        });
+
+    } catch (err) {
+        console.error("Video error:", err);
+        res.status(500).json({ error: "Video lookup failed" });
+    }
+});
 
         // Fallback audio extraction
         const audioUrl =
