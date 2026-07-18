@@ -26,14 +26,14 @@ app.get("/search", async (req, res) => {
         const offset = req.query.offset || "0";
 
         const params = new URLSearchParams({
-            q,
-            client_id: CLIENT_ID,
-            limit,
-            offset,
-            app_version: "1784221259",
-            app_locale: "en",
-            variant_ids: "core"
-        });
+    q,
+    client_id: CLIENT_ID,
+    limit,
+    offset,
+    app_version: "1784221259",
+    app_locale: "en",
+    variant_ids: "core"
+});
 
         const url = `https://api-v2.soundcloud.com/search/tracks?${params.toString()}`;
 
