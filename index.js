@@ -46,11 +46,8 @@ app.get("/video/:id", async (req, res) => {
         const url = `https://yt.chocolatemoo53.com/api/v1/streams/${id}`;
         const data = await fetch(url).then(r => r.json());
 
-        // Pick first available audio stream
         const audioUrl =
-            data.audioStreams?.[0]?.url ||
-            data.audioStreams?.[1]?.url ||
-            null;
+            data.audioStreams?.find(s => s.url)?.url || null;
 
         res.json({
             id,
@@ -62,6 +59,7 @@ app.get("/video/:id", async (req, res) => {
         res.status(500).json({ error: "Video lookup failed" });
     }
 });
+
 
 // --------------------------------------------------
 // 🎤 LYRICS (optional)
