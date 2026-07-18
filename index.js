@@ -6,23 +6,24 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// your SoundCloud client_id (you already found this)
+// Your SoundCloud client_id (public, safe to use)
 const CLIENT_ID = "emAJdGEj1mm9yjoCD2jkixmgqrGIyfpi";
 
 app.use(cors({ origin: "*", methods: ["GET"] }));
 app.use(express.json());
 
-// helper: call SoundCloud API v2
+// Helper: GET JSON
 async function scFetch(url) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`SoundCloud error: ${res.status}`);
     return res.json();
 }
 
-// 🔍 search tracks
+// 🔍 SEARCH ENDPOINT
 app.get("/search", async (req, res) => {
     try {
         const q = req.query.q || "";
+
         const url =
             "https://api-v2.soundcloud.com/search?" +
             new URLSearchParams({
@@ -50,10 +51,11 @@ app.get("/search", async (req, res) => {
     }
 });
 
-// 🎧 get track metadata
+// 🎧 TRACK METADATA
 app.get("/track/:id", async (req, res) => {
     try {
         const id = req.params.id;
+
         const url =
             `https://api-v2.soundcloud.com/tracks/${id}?` +
             new URLSearchParams({ client_id: CLIENT_ID }).toString();
@@ -74,12 +76,12 @@ app.get("/track/:id", async (req, res) => {
     }
 });
 
-// 🎧 get actual MP3 stream URL
+// 🎧 FULL MP3 STREAM RESOLVER (POST FIX APPLIED)
 app.get("/stream/:id", async (req, res) => {
     try {
         const id = req.params.id;
 
-        // 1) get track metadata
+        // 1) Fetch track metadata
         const trackUrl =
             `https://api-v2.soundcloud.com/tracks/${id}?` +
             new URLSearchParams({ client_id: CLIENT_ID }).toString();
@@ -94,10 +96,9 @@ app.get("/stream/:id", async (req, res) => {
             });
         }
 
-        // 2) find progressive/mp3 transcoding
+        // 2) Find progressive transcoding (MP3)
         const transcoding = (track.media?.transcodings || []).find(t =>
-            t.format?.protocol === "progressive" ||
-            t.format?.mime_type === "audio/mpeg"
+            t.format?.protocol === "progressive"
         );
 
         if (!transcoding) {
@@ -108,13 +109,16 @@ app.get("/stream/:id", async (req, res) => {
             });
         }
 
-        // 3) resolve transcoding to actual MP3 URL
-        const resolveUrl =
-            transcoding.url +
-            (transcoding.url.includes("?") ? "&" : "?") +
-            `client_id=${CLIENT_ID}`;
+        // 3) Resolve transcoding → MUST BE POST
+        const resolveUrl = transcoding.url;
 
-        const resolved = await scFetch(resolveUrl);
+        const resolved = await fetch(resolveUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ client_id: CLIENT_ID })
+        }).then(r => r.json());
 
         const mp3Url = resolved.url;
 
@@ -126,12 +130,14 @@ app.get("/stream/:id", async (req, res) => {
             });
         }
 
+        // 4) Return final MP3 URL
         res.json({
             id,
             url: mp3Url,
             title: track.title,
             artist: track.user?.username || "Unknown"
         });
+
     } catch (err) {
         console.error("Stream error:", err.message);
         res.status(500).json({ error: "Stream lookup failed" });
