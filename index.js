@@ -7,136 +7,48 @@ app.use(cors());
 app.use(express.json());
 
 // ===============================
-// ENV VARIABLES
-// ===============================
-const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
-
-if (!CLIENT_ID || !CLIENT_SECRET) {
-    console.error("ERROR: Missing Spotify credentials in Railway!");
-}
-
-// ===============================
-// TOKEN CACHE
-// ===============================
-let spotifyToken = null;
-let spotifyTokenExpires = 0;
-
-// ===============================
-// GET SPOTIFY TOKEN (FREE)
-// ===============================
-async function getSpotifyToken() {
-    // Use cached token if still valid
-    if (spotifyToken && Date.now() < spotifyTokenExpires) {
-        return spotifyToken;
-    }
-
-    // Request new token
-    const res = await fetch("https://accounts.spotify.com/api/token", {
-        method: "POST",
-        headers: {
-            Authorization:
-                "Basic " +
-                Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: "grant_type=client_credentials",
-    });
-
-    const raw = await res.text();
-    console.log("Spotify token response:", raw);
-
-    let data;
-    try {
-        data = JSON.parse(raw);
-    } catch (err) {
-        console.error("Failed to parse token JSON:", err);
-        throw new Error("Invalid Spotify credentials");
-    }
-
-    if (!data.access_token) {
-        console.error("Spotify error:", data);
-        throw new Error("Spotify rejected credentials");
-    }
-
-    spotifyToken = data.access_token;
-    spotifyTokenExpires = Date.now() + data.expires_in * 1000;
-
-    return spotifyToken;
-}
-
-// ===============================
-// SEARCH ROUTE
+// iTunes Search Route
 // ===============================
 app.get("/api/search", async (req, res) => {
     const q = req.query.q;
     if (!q) return res.status(400).json({ error: "Missing q" });
 
     try {
-        const token = await getSpotifyToken();
-
         const r = await fetch(
-            "https://api.spotify.com/v1/search?" +
+            "https://itunes.apple.com/search?" +
                 new URLSearchParams({
-                    q,
-                    type: "track",
+                    term: q,
+                    media: "music",
                     limit: "10",
-                }),
-            {
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                },
-            }
+                })
         );
 
-        const raw = await r.text();
-        console.log("Spotify search response:", raw);
+        const data = await r.json();
 
-        let data;
-        try {
-            data = JSON.parse(raw);
-        } catch (err) {
-            console.error("Failed to parse search JSON:", err);
-            return res.status(500).json({
-                error: "Spotify search returned invalid JSON",
-                raw,
-            });
-        }
-
-        if (!data.tracks || !data.tracks.items) {
-            console.error("Spotify search error:", data);
-            return res.status(500).json({
-                error: "Spotify search failed",
-                details: data,
-            });
-        }
-
-        const tracks = data.tracks.items.map((t) => ({
-            id: t.id,
-            name: t.name,
-            artists: t.artists.map((a) => a.name),
-            albumArt: t.album.images[0]?.url,
+        const tracks = data.results.map((t) => ({
+            id: t.trackId,
+            name: t.trackName,
+            artists: [t.artistName],
+            albumArt: t.artworkUrl100?.replace("100x100", "600x600"),
+            preview: t.previewUrl,
         }));
 
         res.json({ tracks });
     } catch (err) {
         console.error("Backend error:", err);
-        res.status(500).json({
-            error: "Server crashed",
-            details: err.toString(),
-        });
+        res.status(500).json({ error: "Search failed" });
     }
 });
 
 // ===============================
-// ROOT
+// Root
 // ===============================
 app.get("/", (req, res) => {
-    res.send("Hybrid backend running");
+    res.send("Hybrid iTunes backend running");
 });
 
 // ===============================
-// START SERVER
+// Start Server
 // ===============================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
