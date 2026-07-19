@@ -53,31 +53,28 @@ app.get("/api/search", async (req, res) => {
 
         const r = await fetch(
             "https://api.spotify.com/v1/search?" +
-                new URLSearchParams({
-                    q,
-                    type: "track",
-                    limit: "10",
-                }),
-            {
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                },
-            }
+                new URLSearchParams({ q, type: "track", limit: "10" }),
+            { headers: { Authorization: `Bearer ${token}` } }
         );
 
         const data = await r.json();
 
-        const tracks = (data.tracks?.items || []).map((t) => ({
+        if (!data.tracks) {
+            console.log("Spotify error:", data);
+            return res.status(500).json({ error: "Spotify search failed", details: data });
+        }
+
+        const tracks = data.tracks.items.map(t => ({
             id: t.id,
             name: t.name,
-            artists: t.artists.map((a) => a.name),
+            artists: t.artists.map(a => a.name),
             albumArt: t.album.images[0]?.url,
         }));
 
         res.json({ tracks });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Search failed" });
+        console.error("Backend error:", err);
+        res.status(500).json({ error: "Server crashed", details: err.toString() });
     }
 });
 
