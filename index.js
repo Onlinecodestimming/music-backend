@@ -8,6 +8,13 @@ app.use(cors());
 
 const cache = new Map();
 
+/*
+|--------------------------------------------------------------------------
+| SEARCH ENDPOINT
+| Apple Music metadata → YouTube stream
+| YouTube fallback when Apple Music returns nothing
+|--------------------------------------------------------------------------
+*/
 app.get("/search", async (req, res) => {
   const q = req.query.q;
   if (!q) return res.json({ data: [] });
@@ -20,11 +27,20 @@ app.get("/search", async (req, res) => {
     encodeURIComponent(q) +
     "&entity=song&limit=10";
 
-  const appleData = await fetch(appleUrl).then(r => r.json());
+  let appleData;
+  try {
+    appleData = await fetch(appleUrl).then(r => r.json());
+  } catch (e) {
+    appleData = { results: [] };
+  }
 
-  // If Apple Music returns nothing → fallback to YouTube-only search
+  /*
+  |--------------------------------------------------------------------------
+  | FALLBACK TO YOUTUBE IF APPLE MUSIC RETURNS NOTHING
+  |--------------------------------------------------------------------------
+  */
   if (!appleData.results || appleData.results.length === 0) {
-    console.log("Fallback to YouTube search for:", q);
+    console.log("Apple Music returned nothing → YouTube fallback for:", q);
 
     const ytUrl =
       "https://www.youtube.com/results?search_query=" +
@@ -50,8 +66,8 @@ app.get("/search", async (req, res) => {
         type: "songs",
         id: v.videoId,
         attributes: {
-          name: v.title?.runs?.[0]?.text,
-          artistName: v.ownerText?.runs?.[0]?.text,
+          name: v.title?.runs?.[0]?.text || "Unknown Title",
+          artistName: v.ownerText?.runs?.[0]?.text || "Unknown Artist",
           albumName: "YouTube",
           genre: "Unknown",
           releaseDate: null,
@@ -70,7 +86,11 @@ app.get("/search", async (req, res) => {
     return res.json({ data: results });
   }
 
-  // Normal Apple Music + YouTube hybrid search
+  /*
+  |--------------------------------------------------------------------------
+  | NORMAL APPLE MUSIC + YOUTUBE HYBRID SEARCH
+  |--------------------------------------------------------------------------
+  */
   const results = [];
 
   for (const track of appleData.results) {
@@ -124,6 +144,11 @@ app.get("/search", async (req, res) => {
   res.json({ data: results });
 });
 
+/*
+|--------------------------------------------------------------------------
+| STREAM ENDPOINT
+|--------------------------------------------------------------------------
+*/
 app.get("/stream", (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Missing URL");
@@ -133,12 +158,9 @@ app.get("/stream", (req, res) => {
 
   const ytdlp = spawn("/usr/bin/yt-dlp", [
     "--no-check-certificate",
-    "--user-agent",
-    "Mozilla/5.0",
-    "-f",
-    "bestaudio",
-    "-o",
-    "-",
+    "--user-agent", "Mozilla/5.0",
+    "-f", "bestaudio",
+    "-o", "-",
     url
   ]);
 
