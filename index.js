@@ -292,14 +292,19 @@ app.get("/stream", async (req, res) => {
      if (!upstream.ok) return res.status(502).send("Upstream fetch failed");
      const ctype = upstream.headers.get("content-type") || "audio/mpeg";
      res.setHeader("Content-Type", ctype);
-     upstream.body.pipe(res);
+     if (upstream.body) {
+       upstream.body.pipe(res);
+     } else {
+       res.end();
+     }
      return;
    } catch (e) {
-     console.log("Invidious/direct fetch failed:", e);
+     console.log("Direct audio fetch failed:", e);
      // fall through to yt-dlp fallback
    }
  }
 
+ // Use yt-dlp for YouTube/other URLs
  res.setHeader("Content-Type", "audio/mpeg");
  res.setHeader("Transfer-Encoding", "chunked");
  res.setHeader("Accept-Ranges", "none");
@@ -323,22 +328,26 @@ app.get("/stream", async (req, res) => {
  let ytdlp = spawn("yt-dlp", args);
 
  ytdlp.on("error", err => {
-   console.log("yt-dlp failed:", err);
+   console.log("yt-dlp spawn failed:", err);
    // fallback to python -m yt_dlp when yt-dlp binary is not available
    const py = spawn("python", ["-m", "yt_dlp", ...args]);
    py.on("error", err2 => {
-     console.log("python yt_dlp failed:", err2);
-     res.status(500).send("yt-dlp is not available on the server");
+     console.log("python yt_dlp spawn failed:", err2);
+     if (!res.headersSent) {
+       res.status(500).send("yt-dlp is not available");
+     } else {
+       res.end();
+     }
    });
    py.stdout.pipe(res);
-   py.stderr.on("data", d => console.log("yt-dlp stderr:", d.toString()));
+   py.stderr.on("data", d => console.log("python yt_dlp stderr:", d.toString().slice(0, 200)));
    py.on("close", () => { try { res.end(); } catch {} });
  });
 
  ytdlp.stdout.pipe(res);
 
  ytdlp.stderr.on("data", data => {
-   console.log("yt-dlp stderr:", data.toString());
+   console.log("yt-dlp stderr:", data.toString().slice(0, 200));
  });
 
  ytdlp.on("close", () => {
