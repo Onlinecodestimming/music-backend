@@ -11,6 +11,13 @@ import path from "path";
 const app = express();
 app.use(helmet());
 app.use(cors());
+// Allow CORS preflight and explicit CORS headers for /stream (audio proxy)
+app.options('/stream', (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Range,Content-Type");
+  res.sendStatus(204);
+});
 
 const limiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -114,6 +121,11 @@ app.get("/stream", async (req, res) => {
  if (!url) return res.status(400).send("Missing URL");
  if (typeof url !== "string" || !/^https?:\/\//.test(url) || url.length > 2000) return res.status(400).send("Invalid URL");
 
+ // Ensure proper CORS so browsers can load proxied audio
+ res.setHeader("Access-Control-Allow-Origin", "*");
+ res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+ res.setHeader("Access-Control-Allow-Headers", "Range,Content-Type");
+ res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Range");
  res.setHeader("Content-Type", "audio/mpeg");
  res.setHeader("Cache-Control", "public, max-age=3600");
 
