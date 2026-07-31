@@ -7,6 +7,7 @@ import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { google } from "googleapis";
 
 const app = express();
 app.use(helmet());
@@ -45,10 +46,23 @@ app.use('/uploads', (req, res, next) => {
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // Upload endpoint (multipart/form-data field 'file')
-app.post('/upload', upload.single('file'), (req, res) => {
+app.post('/upload', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file' });
-  const url = `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(req.file.filename)}`;
-  res.json({ filename: req.file.filename, url });
+  const localUrl = `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(req.file.filename)}`;
+
+  // If Drive is configured, upload and return drive proxy URL
+  let driveInfo = null;
+  if (DRIVE_ENABLED) {
+    try {
+      driveInfo = await uploadToDrive(path.join(UPLOADS_DIR, req.file.filename), req.file.filename);
+    } catch (e) {
+      console.error('Drive upload error:', e);
+    }
+  }
+
+  const driveProxy = driveInfo ? `${req.protocol}://${req.get('host')}/drive/stream?id=${encodeURIComponent(driveInfo.fileId)}` : null;
+
+  res.json({ filename: req.file.filename, url: localUrl, drive: driveInfo ? { id: driveInfo.fileId, webViewLink: driveInfo.webViewLink, proxyUrl: driveProxy } : null });
 });
 
 // List uploaded files
@@ -82,6 +96,68 @@ if (process.env.YTDLP_COOKIES_B64) {
     ytdlpCookiesPath = null;
   }
 }
+
+// Google Drive helper (service account)
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || null;
+const DRIVE_ENABLED = !!(process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 && DRIVE_FOLDER_ID);
+
+const createDriveClient = () => {
+  if (!DRIVE_ENABLED) return null;
+  try {
+    const sa = JSON.parse(Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64, 'base64').toString());
+    const jwtClient = new google.auth.JWT(sa.client_email, null, sa.private_key, ['https://www.googleapis.com/auth/drive']);
+    const drive = google.drive({ version: 'v3', auth: jwtClient });
+    return { drive, jwtClient, folderId: DRIVE_FOLDER_ID };
+  } catch (e) {
+    console.error('Failed to create Drive client:', e);
+    return null;
+  }
+};
+
+const uploadToDrive = async (filepath, filename) => {
+  const c = createDriveClient();
+  if (!c) return null;
+  try {
+    const { drive, jwtClient, folderId } = c;
+    await jwtClient.authorize();
+    const resp = await drive.files.create({
+      requestBody: { name: filename, parents: [folderId] },
+      media: { body: fs.createReadStream(filepath) },
+      fields: 'id,webViewLink,webContentLink'
+    });
+    const fileId = resp.data.id;
+    // make public
+    try {
+      await drive.permissions.create({ fileId, requestBody: { role: 'reader', type: 'anyone' } });
+    } catch (e) {
+      console.warn('Failed to set public permission on Drive file:', e);
+    }
+    return { fileId, webViewLink: resp.data.webViewLink || `https://drive.google.com/uc?export=download&id=${fileId}` };
+  } catch (e) {
+    console.error('Drive upload failed:', e);
+    return null;
+  }
+};
+
+// Stream a Drive file via service account (proxies to clients)
+app.get('/drive/stream', async (req, res) => {
+  const id = req.query.id;
+  if (!id) return res.status(400).send('Missing id');
+  const c = createDriveClient();
+  if (!c) return res.status(500).send('Drive not configured');
+  try {
+    const { drive, jwtClient } = c;
+    await jwtClient.authorize();
+    const r = await drive.files.get({ fileId: id, alt: 'media' }, { responseType: 'stream' });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const mime = (await drive.files.get({ fileId: id, fields: 'mimeType' })).data.mimeType || 'application/octet-stream';
+    res.setHeader('Content-Type', mime);
+    r.data.pipe(res);
+  } catch (e) {
+    console.error('Drive stream failed:', e);
+    res.status(502).send('Drive stream failed');
+  }
+});
 
 app.get("/search", async (req, res) => {
   let q = req.query.q;
