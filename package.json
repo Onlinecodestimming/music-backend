@@ -1,13 +1,16 @@
 {
-  "name": "soundcloud-backend",
+  "name": "rhema-music-backend",
   "version": "1.0.0",
+  "description": "Apple Music metadata + YouTube streaming backend",
   "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "apt-get update && apt-get install -y yt-dlp"
+  },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.19.2",
     "cors": "^2.8.5",
     "node-fetch": "^3.3.2"
-    "scripts": {
-  "postinstall": "apt-get update && apt-get install -y yt-dlp"
-    }
   }
 }
