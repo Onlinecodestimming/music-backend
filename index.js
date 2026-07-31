@@ -115,8 +115,8 @@ app.get("/search", async (req, res) => {
   // Apple Music results → attach YouTube stream
   const results = [];
 
-  // helper: try a fast yt-dlp ytsearch1 for a single reliable result
-  const findYtPlayUrl = async (query) => {
+  // helper: try a fast yt-dlp ytsearch1 for a single reliable result, with timeout
+  const findYtPlayUrl = async (query, timeoutMs = 3500) => {
     return new Promise((resolve) => {
       try {
         const args = ["--no-warnings", "--dump-json", "ytsearch1:" + query];
@@ -127,7 +127,7 @@ app.get("/search", async (req, res) => {
         let err = "";
         proc.stdout.on("data", d => out += d.toString());
         proc.stderr.on("data", d => err += d.toString());
-        const kill = setTimeout(() => { try { proc.kill(); } catch {} }, 9000);
+        const kill = setTimeout(() => { try { proc.kill(); } catch {} }, timeoutMs);
         proc.on("close", () => {
           clearTimeout(kill);
           if (!out) {
@@ -151,6 +151,7 @@ app.get("/search", async (req, res) => {
     });
   };
 
+  const queries = [];
   for (const track of appleData.results) {
     const name = track.trackName;
     const artist = track.artistName;
@@ -160,10 +161,8 @@ app.get("/search", async (req, res) => {
     let best = ytResults[0];
     let playUrl = best ? best.attributes.playUrl : null;
 
-    // fallback: run a direct yt-dlp search per-track if no playUrl
-    if (!playUrl) {
-      playUrl = await findYtPlayUrl(`${name} ${artist}`);
-    }
+    // store query list and provisional result
+    queries.push({ query: `${name} ${artist}`, playUrl });
 
     results.push({
       type: "songs",
@@ -185,6 +184,26 @@ app.get("/search", async (req, res) => {
       }
     });
   }
+
+  // Run parallel short yt-dlp searches for items without playUrl (keeps latency bounded)
+  const tasks = queries.map((qObj, idx) => {
+    if (qObj.playUrl) return Promise.resolve(null);
+    return findYtPlayUrl(qObj.query, 3000);
+  });
+
+  try {
+    const settled = await Promise.allSettled(tasks);
+    for (let i = 0; i < settled.length; i++) {
+      const s = settled[i];
+      if (s.status === 'fulfilled' && s.value) {
+        results[i].attributes.playUrl = s.value;
+        results[i].attributes.playable = true;
+      }
+    }
+  } catch (e) {
+    console.log('Parallel ytsearch failed:', e);
+  }
+
 
   cache.set(q, results);
   res.json({ data: results });
