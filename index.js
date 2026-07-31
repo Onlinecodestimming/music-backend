@@ -8,16 +8,12 @@ app.use(cors());
 
 const cache = new Map();
 
-/*
-|--------------------------------------------------------------------------
-| SEARCH ENDPOINT
-| Apple Music metadata → YouTube stream
-| YouTube fallback when Apple Music returns nothing
-|--------------------------------------------------------------------------
-*/
 app.get("/search", async (req, res) => {
-  const q = req.query.q;
+  let q = req.query.q;
   if (!q) return res.json({ data: [] });
+
+  // Fix numeric queries + spaces
+  q = q.toString().trim();
 
   if (cache.has(q)) return res.json({ data: cache.get(q) });
 
@@ -30,17 +26,17 @@ app.get("/search", async (req, res) => {
   let appleData;
   try {
     appleData = await fetch(appleUrl).then(r => r.json());
-  } catch (e) {
+  } catch {
     appleData = { results: [] };
   }
 
   /*
   |--------------------------------------------------------------------------
-  | FALLBACK TO YOUTUBE IF APPLE MUSIC RETURNS NOTHING
+  | YOUTUBE FALLBACK (Apple Music returns nothing)
   |--------------------------------------------------------------------------
   */
   if (!appleData.results || appleData.results.length === 0) {
-    console.log("Apple Music returned nothing → YouTube fallback for:", q);
+    console.log("Fallback to YouTube for:", q);
 
     const ytUrl =
       "https://www.youtube.com/results?search_query=" +
@@ -66,7 +62,7 @@ app.get("/search", async (req, res) => {
         type: "songs",
         id: v.videoId,
         attributes: {
-          name: v.title?.runs?.[0]?.text || "Unknown Title",
+          name: v.title?.runs?.[0]?.text || q,
           artistName: v.ownerText?.runs?.[0]?.text || "Unknown Artist",
           albumName: "YouTube",
           genre: "Unknown",
@@ -118,6 +114,12 @@ app.get("/search", async (req, res) => {
         youtubeUrl = "https://youtube.com/watch?v=" + v.videoId;
         break;
       }
+    }
+
+    // Guarantee a fallback YouTube URL
+    if (!youtubeUrl) {
+      youtubeUrl = "https://youtube.com/results?search_query=" +
+                   encodeURIComponent(`${name} ${artist}`);
     }
 
     results.push({
