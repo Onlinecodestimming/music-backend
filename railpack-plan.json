@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "DOCKERFILE"
   },
   "deploy": {
     "startCommand": "node index.js",
