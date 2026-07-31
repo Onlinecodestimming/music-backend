@@ -13,26 +13,25 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const API_BASE = "https://music.apple.com"; // placeholder if you proxy Apple Music or your own source
+const PORT = process.env.PORT || 8080;
 
-// Basic security + CORS
+// basic security + CORS
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limit
+// rate limit
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60
 });
 app.use(limiter);
 
-// Static files
+// static frontend
 app.use(express.static(path.join(__dirname, "public")));
 
-// Uploads folder
+// uploads folder
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 app.use("/uploads", express.static(uploadDir));
@@ -60,62 +59,102 @@ function initDrive() {
 
 initDrive();
 
-async function uploadToDrive(localPath, filename) {
-  if (!drive || !process.env.DRIVE_FOLDER_ID) return null;
+// ---------- Search (Deezer) ----------
 
-  const res = await drive.files.create({
-    requestBody: {
-      name: filename,
-      parents: [process.env.DRIVE_FOLDER_ID]
-    },
-    media: {
-      mimeType: "application/octet-stream",
-      body: fs.createReadStream(localPath)
-    }
-  });
-
-  return res.data.id;
-}
-
-// ---------- Search endpoint (proxy to your music backend) ----------
+const cache = new Map();
 
 app.get("/search", async (req, res) => {
+  let q = req.query.q;
+  if (!q) return res.json({ data: [] });
+
+  q = q.toString().trim();
+  if (q.length > 200) return res.status(400).json({ error: "Query too long" });
+
+  if (cache.has(q)) return res.json({ data: cache.get(q) });
+
+  const deezerUrl = "https://api.deezer.com/search?q=" + encodeURIComponent(q) + "&limit=10";
+
+  let deezerData;
   try {
-    const q = req.query.q;
-    if (!q) return res.status(400).json({ error: "Missing q" });
-
-    // If you already have a backend (music-backend-production-10bd...), call that instead:
-    const upstream = `https://music-backend-production-10bd.up.railway.app/search?q=${encodeURIComponent(q)}`;
-    const r = await fetch(upstream);
-    if (!r.ok) return res.status(r.status).json({ error: "Upstream search failed" });
-
-    const data = await r.json();
-    res.json(data);
-  } catch (err) {
-    console.error("Search error:", err);
-    res.status(500).json({ error: "Search failed" });
+    deezerData = await fetch(deezerUrl).then(r => r.json());
+  } catch {
+    deezerData = { data: [] };
   }
+
+  const results = [];
+
+  if (!deezerData.data || deezerData.data.length === 0) {
+    cache.set(q, results);
+    return res.json({ data: results });
+  }
+
+  for (const track of deezerData.data) {
+    const name = track.title;
+    const artist = track.artist && track.artist.name ? track.artist.name : "";
+    const album = track.album && track.album.title ? track.album.title : null;
+
+    let artworkUrl = null;
+    if (track.album) {
+      artworkUrl =
+        track.album.cover_xl ||
+        track.album.cover_big ||
+        track.album.cover_medium ||
+        track.album.cover;
+    }
+
+    const playUrl = track.preview || null;
+
+    results.push({
+      type: "songs",
+      id: track.id,
+      attributes: {
+        name,
+        artistName: artist,
+        albumName: album,
+        durationInMillis: (track.duration || 0) * 1000,
+        artwork: {
+          url: artworkUrl || null,
+          width: 600,
+          height: 600
+        },
+        playUrl,
+        playable: !!playUrl
+      }
+    });
+  }
+
+  cache.set(q, results);
+  res.json({ data: results });
 });
 
-// ---------- Stream endpoint (proxy stream URL) ----------
+// ---------- Stream (proxy Deezer preview) ----------
 
 app.get("/stream", async (req, res) => {
+  let url = req.query.url;
+  if (!url) return res.status(400).send("Missing URL");
+  if (typeof url !== "string" || !/^https?:\/\//.test(url) || url.length > 2000)
+    return res.status(400).send("Invalid URL");
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Range,Content-Type");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Range");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+
   try {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ error: "Missing url" });
-
-    const r = await fetch(url);
-    if (!r.ok) return res.status(r.status).end();
-
-    res.setHeader("Content-Type", r.headers.get("content-type") || "audio/mpeg");
-    r.body.pipe(res);
-  } catch (err) {
-    console.error("Stream error:", err);
-    res.status(500).json({ error: "Stream failed" });
+    const upstream = await fetch(url);
+    if (!upstream.ok) return res.status(502).send("Upstream fetch failed");
+    const ctype = upstream.headers.get("content-type") || "audio/mpeg";
+    res.setHeader("Content-Type", ctype);
+    if (upstream.body) upstream.body.pipe(res);
+    else res.end();
+  } catch (e) {
+    console.log("Stream fetch failed:", e);
+    res.status(500).send("Failed to fetch stream");
   }
 });
 
-// ---------- Upload endpoint ----------
+// ---------- Upload to local + Drive ----------
 
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
@@ -126,7 +165,17 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 
     let driveFileId = null;
     if (drive && process.env.DRIVE_FOLDER_ID) {
-      driveFileId = await uploadToDrive(localPath, filename);
+      const resDrive = await drive.files.create({
+        requestBody: {
+          name: filename,
+          parents: [process.env.DRIVE_FOLDER_ID]
+        },
+        media: {
+          mimeType: "application/octet-stream",
+          body: fs.createReadStream(localPath)
+        }
+      });
+      driveFileId = resDrive.data.id;
     }
 
     res.json({
@@ -139,7 +188,26 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// ---------- Read existing Drive files ----------
+// ---------- List Drive files (Browse) ----------
+
+app.get("/drive/list", async (req, res) => {
+  try {
+    if (!drive || !process.env.DRIVE_FOLDER_ID)
+      return res.status(500).json({ error: "Drive not configured" });
+
+    const r = await drive.files.list({
+      q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`,
+      fields: "files(id, name, mimeType, size)"
+    });
+
+    res.json({ files: r.data.files || [] });
+  } catch (err) {
+    console.error("Drive list error:", err);
+    res.status(500).json({ error: "Failed to list Drive files" });
+  }
+});
+
+// ---------- Stream existing Drive file ----------
 
 app.get("/drive/:id", async (req, res) => {
   try {
