@@ -27,7 +27,9 @@ let ytdlpCookiesPath = null;
 const INVIDIOUS_INSTANCES = (process.env.INVIDIOUS_INSTANCES ? process.env.INVIDIOUS_INSTANCES.split(",") : [
   "https://yewtu.cafe",
   "https://yewtu.eu",
-  "https://yewtu.snopyta.org"
+  "https://yewtu.snopyta.org",
+  "https://yewtu.kavin.rocks",
+  "https://yewtu.burnash.net"
 ]).map(u => u.replace(/\/$/, ""));
 
 if (process.env.YTDLP_COOKIES_B64) {
@@ -65,6 +67,11 @@ app.get("/search", async (req, res) => {
     return new Promise((resolve) => {
       try {
         const args = ["--no-warnings", "--dump-json", "ytsearch10:" + query];
+        // include cookies if available
+        if (ytdlpCookiesPath) {
+          args.unshift(ytdlpCookiesPath);
+          args.unshift("--cookies");
+        }
         const proc = spawn("yt-dlp", args);
         let outBuf = "";
         let errBuf = "";
@@ -101,8 +108,8 @@ app.get("/search", async (req, res) => {
           }
           resolve(out);
         });
-        // safety: kill after 8s
-        setTimeout(() => { try { proc.kill(); } catch {} }, 8000);
+        // safety: kill after 12s
+        setTimeout(() => { try { proc.kill(); } catch {} }, 12000);
       } catch (e) {
         console.log("ytSearch spawn failed:", e);
         resolve([]);
@@ -121,7 +128,7 @@ app.get("/search", async (req, res) => {
   const results = [];
 
   // helper: try a fast yt-dlp ytsearch1 for a single reliable result, with timeout
-  const findYtPlayUrl = async (query, timeoutMs = 3500) => {
+  const findYtPlayUrl = async (query, timeoutMs = 7000) => {
     return new Promise((resolve) => {
       try {
         const args = ["--no-warnings", "--dump-json", "ytsearch1:" + query];
@@ -162,16 +169,22 @@ app.get("/search", async (req, res) => {
       try {
         const sUrl = `${inst}/api/v1/search?q=${encodeURIComponent(query)}&type=video&per_page=1`;
         const sr = await fetch(sUrl).then(r => { if (!r.ok) throw new Error('bad'); return r.json(); }).catch(() => null);
-        if (!sr || !Array.isArray(sr) || sr.length === 0) continue;
-        const vid = sr[0].videoId || sr[0].id || sr[0].videoId;
+        if (!sr) continue;
+        // support multiple search response shapes
+        let first = null;
+        if (Array.isArray(sr) && sr.length > 0) first = sr[0];
+        else if (Array.isArray(sr.data) && sr.data.length > 0) first = sr.data[0];
+        else if (Array.isArray(sr.videos) && sr.videos.length > 0) first = sr.videos[0];
+        if (!first) continue;
+        const vid = first.videoId || first.id || first.videoId || first.videoId;
         if (!vid) continue;
         const vinfoUrl = `${inst}/api/v1/videos/${vid}`;
         const vinfo = await fetch(vinfoUrl).then(r => { if (!r.ok) throw new Error('bad'); return r.json() }).catch(() => null);
         if (!vinfo) continue;
-        const fmts = vinfo.formats || vinfo.adaptiveFormats || vinfo.playlist || (vinfo.videoDetails && vinfo.videoDetails.formats) || null;
+        const fmts = vinfo.formats || vinfo.formats || vinfo.adaptiveFormats || vinfo.playlist || (vinfo.videoDetails && vinfo.videoDetails.formats) || null;
         if (!fmts || !Array.isArray(fmts)) continue;
         // prefer audio-only formats
-        let candidate = fmts.find(f => (f.mimeType && /audio/.test(f.mimeType)) && f.url) || fmts.find(f => f.url);
+        let candidate = fmts.find(f => ((f.mimeType && /audio/.test(f.mimeType)) || (f.type && /audio/.test(f.type))) && f.url) || fmts.find(f => f.url);
         if (candidate && candidate.url) return candidate.url;
       } catch (e) {
         // try next instance
