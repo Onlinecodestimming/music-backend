@@ -43,16 +43,13 @@ app.get("/search", async (req, res) => {
 
   if (cache.has(q)) return res.json({ data: cache.get(q) });
 
-  const appleUrl =
-    "https://itunes.apple.com/search?term=" +
-    encodeURIComponent(q) +
-    "&entity=song&limit=10";
+  const deezerUrl = "https://api.deezer.com/search?q=" + encodeURIComponent(q) + "&limit=10";
 
-  let appleData;
+  let deezerData;
   try {
-    appleData = await fetch(appleUrl).then(r => r.json());
+    deezerData = await fetch(deezerUrl).then(r => r.json());
   } catch {
-    appleData = { results: [] };
+    deezerData = { data: [] };
   }
 
   const ytSearch = async (query) => {
@@ -105,14 +102,14 @@ app.get("/search", async (req, res) => {
     });
   };
 
-  // Apple Music returned nothing → YouTube fallback
-  if (!appleData.results || appleData.results.length === 0) {
+  // Deezer returned nothing → YouTube fallback
+  if (!deezerData.data || deezerData.data.length === 0) {
     const ytResults = await ytSearch(q);
     cache.set(q, ytResults);
     return res.json({ data: ytResults });
   }
 
-  // Apple Music results → attach YouTube stream
+  // Deezer results → attach YouTube stream
   const results = [];
 
   // helper: try a fast yt-dlp ytsearch1 for a single reliable result, with timeout
@@ -152,9 +149,10 @@ app.get("/search", async (req, res) => {
   };
 
   const queries = [];
-  for (const track of appleData.results) {
-    const name = track.trackName;
-    const artist = track.artistName;
+  for (const track of deezerData.data) {
+    const name = track.title;
+    const artist = track.artist && track.artist.name ? track.artist.name : '';
+    const album = track.album && track.album.title ? track.album.title : null;
 
     // prefer the HTML ytSearch results if present
     let ytResults = await ytSearch(`${name} ${artist}`);
@@ -164,18 +162,24 @@ app.get("/search", async (req, res) => {
     // store query list and provisional result
     queries.push({ query: `${name} ${artist}`, playUrl });
 
+    // choose best artwork available
+    let artworkUrl = null;
+    if (track.album) {
+      artworkUrl = track.album.cover_xl || track.album.cover_big || track.album.cover_medium || track.album.cover;
+    }
+
     results.push({
       type: "songs",
-      id: track.trackId,
+      id: track.id,
       attributes: {
-        name: track.trackName,
-        artistName: track.artistName,
-        albumName: track.collectionName,
-        genre: track.primaryGenreName,
-        releaseDate: track.releaseDate,
-        durationInMillis: track.trackTimeMillis,
+        name: name,
+        artistName: artist,
+        albumName: album,
+        genre: null,
+        releaseDate: track.release_date || null,
+        durationInMillis: (track.duration || 0) * 1000,
         artwork: {
-          url: track.artworkUrl100.replace("100x100", "600x600"),
+          url: artworkUrl || null,
           width: 600,
           height: 600
         },
