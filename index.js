@@ -56,46 +56,53 @@ app.get("/search", async (req, res) => {
   }
 
   const ytSearch = async (query) => {
-    const ytUrl =
-      "https://www.youtube.com/results?search_query=" +
-      encodeURIComponent(query);
-
-    const html = await fetch(ytUrl).then(r => r.text());
-    const jsonMatch = html.match(/ytInitialData"\s*:\s*(\{.*?\})\s*[,<]/s);
-    if (!jsonMatch) return [];
-
-    const data = JSON.parse(jsonMatch[1]);
-    const items =
-      data.contents?.twoColumnSearchResultsRenderer?.primaryContents
-        ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
-
-    const out = [];
-
-    for (const item of items) {
-      const v = item.videoRenderer;
-      if (!v) continue;
-
-      out.push({
-        type: "songs",
-        id: v.videoId,
-        attributes: {
-          name: v.title?.runs?.[0]?.text || query,
-          artistName: v.ownerText?.runs?.[0]?.text || "Unknown Artist",
-          albumName: "YouTube",
-          genre: "Unknown",
-          releaseDate: null,
-          durationInMillis: 0,
-          artwork: {
-            url: v.thumbnail?.thumbnails?.slice(-1)[0]?.url,
-            width: 600,
-            height: 600
-          },
-          playUrl: "https://youtube.com/watch?v=" + v.videoId
-        }
-      });
-    }
-
-    return out;
+    // Use yt-dlp's ytsearch to reliably find YouTube results instead of scraping HTML
+    return new Promise((resolve) => {
+      try {
+        const args = ["--no-warnings", "--dump-json", "ytsearch10:" + query];
+        const proc = spawn("yt-dlp", args);
+        let outBuf = "";
+        let errBuf = "";
+        proc.stdout.on("data", d => { outBuf += d.toString(); });
+        proc.stderr.on("data", d => { errBuf += d.toString(); });
+        proc.on("close", () => {
+          if (!outBuf || outBuf.trim().length === 0) {
+            console.log("yt-dlp search produced no output, stderr:", errBuf);
+            return resolve([]);
+          }
+          const lines = outBuf.trim().split(/\r?\n/);
+          const out = [];
+          for (const line of lines) {
+            try {
+              const v = JSON.parse(line);
+              const id = v.id || v.video_id || v.webpage_url?.split('v=')?.pop();
+              out.push({
+                type: "songs",
+                id: id,
+                attributes: {
+                  name: v.title || query,
+                  artistName: v.uploader || v.channel || "Unknown Artist",
+                  albumName: "YouTube",
+                  genre: "Unknown",
+                  releaseDate: v.upload_date || null,
+                  durationInMillis: v.duration ? Math.floor(v.duration * 1000) : 0,
+                  artwork: { url: v.thumbnail || null, width: 600, height: 600 },
+                  playUrl: id ? "https://youtube.com/watch?v=" + id : (v.webpage_url || null)
+                }
+              });
+            } catch (e) {
+              console.log("Failed to parse yt-dlp json line:", e, line.slice(0,200));
+            }
+          }
+          resolve(out);
+        });
+        // safety: kill after 8s
+        setTimeout(() => { try { proc.kill(); } catch {} }, 8000);
+      } catch (e) {
+        console.log("ytSearch spawn failed:", e);
+        resolve([]);
+      }
+    });
   };
 
   // Apple Music returned nothing → YouTube fallback
