@@ -14,12 +14,63 @@ app.get("/search", async (req, res) => {
 
   if (cache.has(q)) return res.json({ data: cache.get(q) });
 
+  // Apple Music metadata (iTunes API)
   const appleUrl =
     "https://itunes.apple.com/search?term=" +
     encodeURIComponent(q) +
     "&entity=song&limit=10";
 
   const appleData = await fetch(appleUrl).then(r => r.json());
+
+  // If Apple Music returns nothing → fallback to YouTube-only search
+  if (!appleData.results || appleData.results.length === 0) {
+    console.log("Fallback to YouTube search for:", q);
+
+    const ytUrl =
+      "https://www.youtube.com/results?search_query=" +
+      encodeURIComponent(q);
+
+    const html = await fetch(ytUrl).then(r => r.text());
+    const jsonMatch = html.match(/ytInitialData"\s*:\s*(\{.*?\})\s*[,<]/s);
+
+    if (!jsonMatch) return res.json({ data: [] });
+
+    const data = JSON.parse(jsonMatch[1]);
+    const items =
+      data.contents?.twoColumnSearchResultsRenderer?.primaryContents
+        ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+
+    const results = [];
+
+    for (const item of items) {
+      const v = item.videoRenderer;
+      if (!v) continue;
+
+      results.push({
+        type: "songs",
+        id: v.videoId,
+        attributes: {
+          name: v.title?.runs?.[0]?.text,
+          artistName: v.ownerText?.runs?.[0]?.text,
+          albumName: "YouTube",
+          genre: "Unknown",
+          releaseDate: null,
+          durationInMillis: 0,
+          artwork: {
+            url: v.thumbnail?.thumbnails?.slice(-1)[0]?.url,
+            width: 600,
+            height: 600
+          },
+          playUrl: "https://youtube.com/watch?v=" + v.videoId
+        }
+      });
+    }
+
+    cache.set(q, results);
+    return res.json({ data: results });
+  }
+
+  // Normal Apple Music + YouTube hybrid search
   const results = [];
 
   for (const track of appleData.results) {
@@ -82,9 +133,12 @@ app.get("/stream", (req, res) => {
 
   const ytdlp = spawn("/usr/bin/yt-dlp", [
     "--no-check-certificate",
-    "--user-agent", "Mozilla/5.0",
-    "-f", "bestaudio",
-    "-o", "-",
+    "--user-agent",
+    "Mozilla/5.0",
+    "-f",
+    "bestaudio",
+    "-o",
+    "-",
     url
   ]);
 
