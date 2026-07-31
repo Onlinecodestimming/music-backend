@@ -20,6 +20,55 @@ app.use(limiter);
 
 const cache = new Map();
 
+// uploads directory for user-provided files
+const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+import multer from 'multer';
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const safe = Date.now() + '_' + file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+    cb(null, safe);
+  }
+});
+const upload = multer({ storage });
+
+// Serve uploaded files and allow directory listing via API
+app.use('/uploads', (req, res, next) => {
+  // allow CORS for uploads
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+// Upload endpoint (multipart/form-data field 'file')
+app.post('/upload', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  const url = `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(req.file.filename)}`;
+  res.json({ filename: req.file.filename, url });
+});
+
+// List uploaded files
+app.get('/upload/list', (req, res) => {
+  try {
+    const files = fs.readdirSync(UPLOADS_DIR).map(name => {
+      const stat = fs.statSync(path.join(UPLOADS_DIR, name));
+      return {
+        name,
+        url: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`,
+        size: stat.size,
+        mtime: stat.mtime
+      };
+    }).sort((a,b) => b.mtime - a.mtime);
+    res.json({ data: files });
+  } catch (e) {
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
 // If user supplied YTDLP_COOKIES_B64 in env, write it to a temporary cookies file for yt-dlp to use
 let ytdlpCookiesPath = null;
 if (process.env.YTDLP_COOKIES_B64) {
