@@ -1,12 +1,10 @@
 {
-  "name": "rhema-music-backend",
+  "name": "music-backend",
   "version": "1.0.0",
-  "description": "Apple Music metadata + YouTube streaming backend",
   "type": "module",
-  "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "postinstall": "apt-get update && apt-get install -y yt-dlp"
+    "postinstall": "pip install yt-dlp"
   },
   "dependencies": {
     "express": "^4.19.2",
