@@ -12,12 +12,10 @@ app.get("/search", async (req, res) => {
   let q = req.query.q;
   if (!q) return res.json({ data: [] });
 
-  // Fix numeric queries + spaces
   q = q.toString().trim();
 
   if (cache.has(q)) return res.json({ data: cache.get(q) });
 
-  // Apple Music metadata (iTunes API)
   const appleUrl =
     "https://itunes.apple.com/search?term=" +
     encodeURIComponent(q) +
@@ -30,39 +28,36 @@ app.get("/search", async (req, res) => {
     appleData = { results: [] };
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | YOUTUBE FALLBACK (Apple Music returns nothing)
-  |--------------------------------------------------------------------------
-  */
-  if (!appleData.results || appleData.results.length === 0) {
-    console.log("Fallback to YouTube for:", q);
+  const results = [];
 
+  // If Apple Music returns nothing → YouTube fallback
+  const needFallback = !appleData.results || appleData.results.length === 0;
+
+  const ytSearch = async (query) => {
     const ytUrl =
       "https://www.youtube.com/results?search_query=" +
-      encodeURIComponent(q);
+      encodeURIComponent(query);
 
     const html = await fetch(ytUrl).then(r => r.text());
     const jsonMatch = html.match(/ytInitialData"\s*:\s*(\{.*?\})\s*[,<]/s);
-
-    if (!jsonMatch) return res.json({ data: [] });
+    if (!jsonMatch) return [];
 
     const data = JSON.parse(jsonMatch[1]);
     const items =
       data.contents?.twoColumnSearchResultsRenderer?.primaryContents
         ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
 
-    const results = [];
+    const out = [];
 
     for (const item of items) {
       const v = item.videoRenderer;
       if (!v) continue;
 
-      results.push({
+      out.push({
         type: "songs",
         id: v.videoId,
         attributes: {
-          name: v.title?.runs?.[0]?.text || q,
+          name: v.title?.runs?.[0]?.text || query,
           artistName: v.ownerText?.runs?.[0]?.text || "Unknown Artist",
           albumName: "YouTube",
           genre: "Unknown",
@@ -78,49 +73,23 @@ app.get("/search", async (req, res) => {
       });
     }
 
-    cache.set(q, results);
-    return res.json({ data: results });
+    return out;
+  };
+
+  if (needFallback) {
+    console.log("Apple Music returned nothing → YouTube fallback:", q);
+    const ytResults = await ytSearch(q);
+    cache.set(q, ytResults);
+    return res.json({ data: ytResults });
   }
 
-  /*
-  |--------------------------------------------------------------------------
-  | NORMAL APPLE MUSIC + YOUTUBE HYBRID SEARCH
-  |--------------------------------------------------------------------------
-  */
-  const results = [];
-
+  // Apple Music results → attach YouTube stream
   for (const track of appleData.results) {
     const name = track.trackName;
     const artist = track.artistName;
 
-    const ytUrl =
-      "https://www.youtube.com/results?search_query=" +
-      encodeURIComponent(`${name} ${artist}`);
-
-    const html = await fetch(ytUrl).then(r => r.text());
-    const jsonMatch = html.match(/ytInitialData"\s*:\s*(\{.*?\})\s*[,<]/s);
-
-    let youtubeUrl = null;
-
-    if (jsonMatch) {
-      const data = JSON.parse(jsonMatch[1]);
-      const items =
-        data.contents?.twoColumnSearchResultsRenderer?.primaryContents
-          ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
-
-      for (const item of items) {
-        const v = item.videoRenderer;
-        if (!v) continue;
-        youtubeUrl = "https://youtube.com/watch?v=" + v.videoId;
-        break;
-      }
-    }
-
-    // Guarantee a fallback YouTube URL
-    if (!youtubeUrl) {
-      youtubeUrl = "https://youtube.com/results?search_query=" +
-                   encodeURIComponent(`${name} ${artist}`);
-    }
+    const ytResults = await ytSearch(`${name} ${artist}`);
+    const best = ytResults[0];
 
     results.push({
       type: "songs",
@@ -137,7 +106,7 @@ app.get("/search", async (req, res) => {
           width: 600,
           height: 600
         },
-        playUrl: youtubeUrl
+        playUrl: best ? best.attributes.playUrl : null
       }
     });
   }
@@ -146,11 +115,6 @@ app.get("/search", async (req, res) => {
   res.json({ data: results });
 });
 
-/*
-|--------------------------------------------------------------------------
-| STREAM ENDPOINT
-|--------------------------------------------------------------------------
-*/
 app.get("/stream", (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Missing URL");
