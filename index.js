@@ -4,6 +4,9 @@ import fetch from "node-fetch";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { spawn } from "child_process";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 const app = express();
 app.use(helmet());
@@ -16,6 +19,20 @@ const limiter = rateLimit({
 app.use(limiter);
 
 const cache = new Map();
+
+// If user supplied YTDLP_COOKIES_B64 in env, write it to a temporary cookies file for yt-dlp to use
+let ytdlpCookiesPath = null;
+if (process.env.YTDLP_COOKIES_B64) {
+  try {
+    const buff = Buffer.from(process.env.YTDLP_COOKIES_B64, "base64");
+    ytdlpCookiesPath = path.join(os.tmpdir(), "yt-cookies.txt");
+    fs.writeFileSync(ytdlpCookiesPath, buff, { mode: 0o600 });
+    console.log("Wrote yt-dlp cookies to", ytdlpCookiesPath);
+  } catch (e) {
+    console.error("Failed to write yt-dlp cookies:", e);
+    ytdlpCookiesPath = null;
+  }
+}
 
 app.get("/search", async (req, res) => {
   let q = req.query.q;
@@ -131,7 +148,21 @@ app.get("/stream", (req, res) => {
   res.setHeader("Transfer-Encoding", "chunked");
   res.setHeader("Accept-Ranges", "none");
 
-  const args = ["-f", "bestaudio", "-o", "-", url];
+  const baseArgs = [
+    "-f", "bestaudio[ext=m4a]/bestaudio/best",
+    "--no-playlist",
+    "--geo-bypass",
+    "--no-check-certificate",
+    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+    "-o", "-",
+    url
+  ];
+
+  const args = Array.from(baseArgs);
+  if (ytdlpCookiesPath) {
+    args.unshift(ytdlpCookiesPath);
+    args.unshift("--cookies");
+  }
   let ytdlp = spawn("yt-dlp", args);
 n  ytdlp.on("error", err => {
     console.log("yt-dlp failed:", err);
