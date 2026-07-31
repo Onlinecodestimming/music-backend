@@ -22,6 +22,14 @@ const cache = new Map();
 
 // If user supplied YTDLP_COOKIES_B64 in env, write it to a temporary cookies file for yt-dlp to use
 let ytdlpCookiesPath = null;
+
+// Invidious instances used as fallbacks for YouTube audio (server proxies the audio URL)
+const INVIDIOUS_INSTANCES = (process.env.INVIDIOUS_INSTANCES ? process.env.INVIDIOUS_INSTANCES.split(",") : [
+  "https://yewtu.cafe",
+  "https://yewtu.eu",
+  "https://yewtu.snopyta.org"
+]).map(u => u.replace(/\/$/, ""));
+
 if (process.env.YTDLP_COOKIES_B64) {
   try {
     const buff = Buffer.from(process.env.YTDLP_COOKIES_B64, "base64");
@@ -148,6 +156,30 @@ app.get("/search", async (req, res) => {
     });
   };
 
+  // Try Invidious instances to find a direct audio URL for a query
+  const findInvidiousPlayUrl = async (query, timeoutMs = 3000) => {
+    for (const inst of INVIDIOUS_INSTANCES) {
+      try {
+        const sUrl = `${inst}/api/v1/search?q=${encodeURIComponent(query)}&type=video&per_page=1`;
+        const sr = await fetch(sUrl).then(r => { if (!r.ok) throw new Error('bad'); return r.json(); }).catch(() => null);
+        if (!sr || !Array.isArray(sr) || sr.length === 0) continue;
+        const vid = sr[0].videoId || sr[0].id || sr[0].videoId;
+        if (!vid) continue;
+        const vinfoUrl = `${inst}/api/v1/videos/${vid}`;
+        const vinfo = await fetch(vinfoUrl).then(r => { if (!r.ok) throw new Error('bad'); return r.json() }).catch(() => null);
+        if (!vinfo) continue;
+        const fmts = vinfo.formats || vinfo.adaptiveFormats || vinfo.playlist || (vinfo.videoDetails && vinfo.videoDetails.formats) || null;
+        if (!fmts || !Array.isArray(fmts)) continue;
+        // prefer audio-only formats
+        let candidate = fmts.find(f => (f.mimeType && /audio/.test(f.mimeType)) && f.url) || fmts.find(f => f.url);
+        if (candidate && candidate.url) return candidate.url;
+      } catch (e) {
+        // try next instance
+      }
+    }
+    return null;
+  };
+
   const queries = [];
   for (const track of deezerData.data) {
     const name = track.title;
@@ -208,58 +240,97 @@ app.get("/search", async (req, res) => {
     console.log('Parallel ytsearch failed:', e);
   }
 
+  // For any remaining items without playUrl, try Invidious instances as a fallback
+  const tryInvidiousTasks = results.map(async (r) => {
+    if (r.attributes && r.attributes.playUrl) return null;
+    const qstr = `${r.attributes.name} ${r.attributes.artistName}`;
+    try {
+      const inUrl = await findInvidiousPlayUrl(qstr, 3000);
+      if (inUrl) {
+        r.attributes.playUrl = inUrl;
+        r.attributes.playable = true;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return null;
+  });
+
+  try {
+    await Promise.allSettled(tryInvidiousTasks);
+  } catch (e) {
+    console.log('Invidious fallback failed:', e);
+  }
 
   cache.set(q, results);
   res.json({ data: results });
 });
 
-app.get("/stream", (req, res) => {
+app.get("/stream", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Missing URL");
   if (typeof url !== "string" || !/^https?:\/\//.test(url) || url.length > 2000) return res.status(400).send("Invalid URL");
 
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.setHeader("Accept-Ranges", "none");
+ // If the URL is a direct audio file or from an Invidious instance, proxy it directly
+ const isDirectAudio = /\.(mp3|m4a|aac|ogg|webm)(\?|$)/i.test(url) || INVIDIOUS_INSTANCES.some(inst => url.startsWith(inst));
+ if (isDirectAudio) {
+   try {
+     const upstream = await fetch(url);
+     if (!upstream.ok) return res.status(502).send("Upstream fetch failed");
+     const ctype = upstream.headers.get("content-type") || "audio/mpeg";
+     res.setHeader("Content-Type", ctype);
+     upstream.body.pipe(res);
+     return;
+   } catch (e) {
+     console.log("Invidious/direct fetch failed:", e);
+     // fall through to yt-dlp fallback
+   }
+ }
 
-  const baseArgs = [
-    "-f", "bestaudio[ext=m4a]/bestaudio/best",
-    "--no-playlist",
-    "--geo-bypass",
-    "--no-check-certificate",
-    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
-    "-o", "-",
-    url
-  ];
+ res.setHeader("Content-Type", "audio/mpeg");
+ res.setHeader("Transfer-Encoding", "chunked");
+ res.setHeader("Accept-Ranges", "none");
 
-  const args = Array.from(baseArgs);
-  if (ytdlpCookiesPath) {
-    args.unshift(ytdlpCookiesPath);
-    args.unshift("--cookies");
-  }
-  let ytdlp = spawn("yt-dlp", args);
-  ytdlp.on("error", err => {
-    console.log("yt-dlp failed:", err);
-    // fallback to python -m yt_dlp when yt-dlp binary is not available
-    const py = spawn("python", ["-m", "yt_dlp", ...args]);
-    py.on("error", err2 => {
-      console.log("python yt_dlp failed:", err2);
-      res.status(500).send("yt-dlp is not available on the server");
-    });
-    py.stdout.pipe(res);
-    py.stderr.on("data", d => console.log("yt-dlp stderr:", d.toString()));
-    py.on("close", () => { try { res.end(); } catch {} });
-  });
+ const baseArgs = [
+   "-f", "bestaudio[ext=m4a]/bestaudio/best",
+   "--no-playlist",
+   "--geo-bypass",
+   "--no-check-certificate",
+   "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
+   "-o", "-",
+   url
+ ];
 
-  ytdlp.stdout.pipe(res);
+ const args = Array.from(baseArgs);
+ if (ytdlpCookiesPath) {
+   args.unshift(ytdlpCookiesPath);
+   args.unshift("--cookies");
+ }
 
-  ytdlp.stderr.on("data", data => {
-    console.log("yt-dlp stderr:", data.toString());
-  });
+ let ytdlp = spawn("yt-dlp", args);
 
-  ytdlp.on("close", () => {
-    try { res.end(); } catch {}
-  });
+ ytdlp.on("error", err => {
+   console.log("yt-dlp failed:", err);
+   // fallback to python -m yt_dlp when yt-dlp binary is not available
+   const py = spawn("python", ["-m", "yt_dlp", ...args]);
+   py.on("error", err2 => {
+     console.log("python yt_dlp failed:", err2);
+     res.status(500).send("yt-dlp is not available on the server");
+   });
+   py.stdout.pipe(res);
+   py.stderr.on("data", d => console.log("yt-dlp stderr:", d.toString()));
+   py.on("close", () => { try { res.end(); } catch {} });
+ });
+
+ ytdlp.stdout.pipe(res);
+
+ ytdlp.stderr.on("data", data => {
+   console.log("yt-dlp stderr:", data.toString());
+ });
+
+ ytdlp.on("close", () => {
+   try { res.end(); } catch {}
+ });
 });
 
 app.listen(process.env.PORT || 8080, () => console.log("Backend running on port", process.env.PORT || 8080));
