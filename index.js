@@ -164,7 +164,7 @@ app.get("/stream", (req, res) => {
     args.unshift("--cookies");
   }
   let ytdlp = spawn("yt-dlp", args);
-n  ytdlp.on("error", err => {
+  ytdlp.on("error", err => {
     console.log("yt-dlp failed:", err);
     // fallback to python -m yt_dlp when yt-dlp binary is not available
     const py = spawn("python", ["-m", "yt_dlp", ...args]);
@@ -178,7 +178,8 @@ app.get("/stream", (req, res) => {
   });
 
   ytdlp.stdout.pipe(res);
-n  ytdlp.stderr.on("data", data => {
+
+  ytdlp.stderr.on("data", data => {
     console.log("yt-dlp stderr:", data.toString());
   });
 
