@@ -115,12 +115,55 @@ app.get("/search", async (req, res) => {
   // Apple Music results → attach YouTube stream
   const results = [];
 
+  // helper: try a fast yt-dlp ytsearch1 for a single reliable result
+  const findYtPlayUrl = async (query) => {
+    return new Promise((resolve) => {
+      try {
+        const args = ["--no-warnings", "--dump-json", "ytsearch1:" + query];
+        // include cookies if available
+        if (ytdlpCookiesPath) args.unshift(ytdlpCookiesPath), args.unshift("--cookies");
+        const proc = spawn("yt-dlp", args);
+        let out = "";
+        let err = "";
+        proc.stdout.on("data", d => out += d.toString());
+        proc.stderr.on("data", d => err += d.toString());
+        const kill = setTimeout(() => { try { proc.kill(); } catch {} }, 9000);
+        proc.on("close", () => {
+          clearTimeout(kill);
+          if (!out) {
+            console.log("ytsearch produced no output for:", query, "err:", err.slice(0,200));
+            return resolve(null);
+          }
+          try {
+            const v = JSON.parse(out.trim().split(/\r?\n/)[0]);
+            const id = v.id || v.video_id || (v.webpage_url && v.webpage_url.split('v=')?.pop());
+            if (id) return resolve("https://youtube.com/watch?v=" + id);
+            return resolve(v.webpage_url || null);
+          } catch (e) {
+            console.log("failed parse ytsearch json:", e, out.slice(0,200));
+            return resolve(null);
+          }
+        });
+      } catch (e) {
+        console.log("findYtPlayUrl spawn failed:", e);
+        resolve(null);
+      }
+    });
+  };
+
   for (const track of appleData.results) {
     const name = track.trackName;
     const artist = track.artistName;
 
-    const ytResults = await ytSearch(`${name} ${artist}`);
-    const best = ytResults[0];
+    // prefer the HTML ytSearch results if present
+    let ytResults = await ytSearch(`${name} ${artist}`);
+    let best = ytResults[0];
+    let playUrl = best ? best.attributes.playUrl : null;
+
+    // fallback: run a direct yt-dlp search per-track if no playUrl
+    if (!playUrl) {
+      playUrl = await findYtPlayUrl(`${name} ${artist}`);
+    }
 
     results.push({
       type: "songs",
@@ -137,7 +180,8 @@ app.get("/search", async (req, res) => {
           width: 600,
           height: 600
         },
-        playUrl: best ? best.attributes.playUrl : null
+        playUrl: playUrl || null,
+        playable: !!playUrl
       }
     });
   }
