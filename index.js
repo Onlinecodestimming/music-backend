@@ -8,11 +8,6 @@ app.use(cors());
 
 const cache = new Map();
 
-/*
-|--------------------------------------------------------------------------
-| SEARCH ENDPOINT
-|--------------------------------------------------------------------------
-*/
 app.get("/search", async (req, res) => {
   let q = req.query.q;
   if (!q) return res.json({ data: [] });
@@ -32,8 +27,6 @@ app.get("/search", async (req, res) => {
   } catch {
     appleData = { results: [] };
   }
-
-  const results = [];
 
   const ytSearch = async (query) => {
     const ytUrl =
@@ -86,6 +79,8 @@ app.get("/search", async (req, res) => {
   }
 
   // Apple Music results → attach YouTube stream
+  const results = [];
+
   for (const track of appleData.results) {
     const name = track.trackName;
     const artist = track.artistName;
@@ -117,11 +112,6 @@ app.get("/search", async (req, res) => {
   res.json({ data: results });
 });
 
-/*
-|--------------------------------------------------------------------------
-| STREAM ENDPOINT (yt-dlp FIXED)
-|--------------------------------------------------------------------------
-*/
 app.get("/stream", (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Missing URL");
@@ -129,7 +119,7 @@ app.get("/stream", (req, res) => {
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Transfer-Encoding", "chunked");
 
-  // Use yt-dlp from PATH (Railway installs it here)
+  // yt-dlp from PATH (Dockerfile installs it)
   const ytdlp = spawn("yt-dlp", [
     "-f", "bestaudio",
     "-o", "-",
@@ -138,7 +128,7 @@ app.get("/stream", (req, res) => {
 
   ytdlp.on("error", err => {
     console.log("yt-dlp failed:", err);
-    res.status(500).send("yt-dlp is not installed or not in PATH");
+    res.status(500).send("yt-dlp is not installed");
   });
 
   ytdlp.stdout.pipe(res);
