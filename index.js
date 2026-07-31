@@ -8,6 +8,11 @@ app.use(cors());
 
 const cache = new Map();
 
+/*
+|--------------------------------------------------------------------------
+| SEARCH ENDPOINT
+|--------------------------------------------------------------------------
+*/
 app.get("/search", async (req, res) => {
   let q = req.query.q;
   if (!q) return res.json({ data: [] });
@@ -29,9 +34,6 @@ app.get("/search", async (req, res) => {
   }
 
   const results = [];
-
-  // If Apple Music returns nothing → YouTube fallback
-  const needFallback = !appleData.results || appleData.results.length === 0;
 
   const ytSearch = async (query) => {
     const ytUrl =
@@ -76,8 +78,8 @@ app.get("/search", async (req, res) => {
     return out;
   };
 
-  if (needFallback) {
-    console.log("Apple Music returned nothing → YouTube fallback:", q);
+  // Apple Music returned nothing → YouTube fallback
+  if (!appleData.results || appleData.results.length === 0) {
     const ytResults = await ytSearch(q);
     cache.set(q, ytResults);
     return res.json({ data: ytResults });
@@ -115,6 +117,11 @@ app.get("/search", async (req, res) => {
   res.json({ data: results });
 });
 
+/*
+|--------------------------------------------------------------------------
+| STREAM ENDPOINT (yt-dlp FIXED)
+|--------------------------------------------------------------------------
+*/
 app.get("/stream", (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Missing URL");
@@ -122,9 +129,8 @@ app.get("/stream", (req, res) => {
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Transfer-Encoding", "chunked");
 
-  const ytdlp = spawn("/usr/bin/yt-dlp", [
-    "--no-check-certificate",
-    "--user-agent", "Mozilla/5.0",
+  // Use yt-dlp from PATH (Railway installs it here)
+  const ytdlp = spawn("yt-dlp", [
     "-f", "bestaudio",
     "-o", "-",
     url
@@ -132,11 +138,15 @@ app.get("/stream", (req, res) => {
 
   ytdlp.on("error", err => {
     console.log("yt-dlp failed:", err);
-    res.status(500).send("yt-dlp is not installed");
+    res.status(500).send("yt-dlp is not installed or not in PATH");
   });
 
   ytdlp.stdout.pipe(res);
-  ytdlp.stderr.on("data", () => {});
+
+  ytdlp.stderr.on("data", data => {
+    console.log("yt-dlp stderr:", data.toString());
+  });
+
   ytdlp.on("close", () => {
     try { res.end(); } catch {}
   });
