@@ -1,34 +1,53 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>NoteFlow</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
-  <header class="top">
-    <div class="brand">NoteFlow</div>
-    <input id="searchBar" class="search" placeholder="Search…" onkeyup="if(event.key==='Enter') search()">
-  </header>
-
-  <main class="main">
-    <aside class="sidebar">
-      <div class="upload-box">
-        <form id="uploadForm">
-          <input id="uploadInput" type="file" accept="audio/*">
-          <button type="submit">Upload</button>
-        </form>
-        <div id="uploads" class="uploads"></div>
+  <div class="container">
+    <header class="header">
+      <div class="header-content">
+        <h1 class="logo">🎵 NoteFlow</h1>
+        <input id="searchBar" class="search-input" placeholder="Search songs, artists…" onkeyup="if(event.key==='Enter') search()">
       </div>
-    </aside>
+    </header>
 
-    <section class="content">
-      <div id="results" class="results"></div>
-      <audio id="player" controls></audio>
-    </section>
-  </main>
+    <main class="main-content">
+      <aside class="sidebar">
+        <div class="upload-section">
+          <h3 class="section-title">Upload Music</h3>
+          <form id="uploadForm" class="upload-form">
+            <label class="upload-label">
+              <input id="uploadInput" type="file" accept="audio/*" hidden>
+              <span class="upload-btn">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 2v20m10-10H2"/>
+                </svg>
+                Choose File
+              </span>
+            </label>
+            <button type="submit" class="upload-submit">Upload</button>
+          </form>
+        </div>
 
-  <script src="frontend.js?v=4"></script>
+        <div class="uploads-section">
+          <h3 class="section-title">Your Files</h3>
+          <div id="uploads" class="uploads-list"></div>
+        </div>
+      </aside>
+
+      <section class="content">
+        <div id="results" class="results-grid"></div>
+        <div class="player-container">
+          <audio id="player" controls></audio>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="frontend.js?v=5"></script>
 </body>
 </html>

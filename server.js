@@ -12,6 +12,7 @@ import { google } from "googleapis";
 const app = express();
 app.use(helmet());
 app.use(cors());
+app.use(express.json());
 
 const limiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -158,6 +159,109 @@ app.get('/drive/stream', async (req, res) => {
     res.status(502).send('Drive stream failed');
   }
 });
+
+// Metadata store for Drive items (local JSON)
+const METADATA_FILE = path.join(UPLOADS_DIR, 'metadata.json');
+const loadMetadata = () => {
+  try {
+    return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')) || {};
+  } catch (e) { return {}; }
+};
+const saveMetadata = (m) => {
+  try { fs.writeFileSync(METADATA_FILE, JSON.stringify(m, null, 2)); } catch (e) { console.error('Failed to save metadata', e); }
+};
+
+// List files in Drive folder with metadata overlay
+app.get('/drive/list', async (req, res) => {
+  const c = createDriveClient();
+  if (!c) return res.json({ data: [] });
+  try {
+    const { drive, jwtClient, folderId } = c;
+    await jwtClient.authorize();
+    const resp = await drive.files.list({ q: `'${folderId}' in parents and trashed=false`, fields: 'files(id,name,mimeType,size,thumbnailLink,createdTime,modifiedTime)', pageSize: 200 });
+    const files = resp.data.files || [];
+    const meta = loadMetadata();
+    const out = files.map(f => ({
+      type: 'songs',
+      id: f.id,
+      attributes: {
+        name: f.name,
+        artistName: meta[f.id]?.artistName || 'Unknown',
+        albumName: meta[f.id]?.albumName || null,
+        durationInMillis: null,
+        artwork: { url: meta[f.id]?.artworkUrl || f.thumbnailLink || null, width: 600, height: 600 },
+        playUrl: `${req.protocol}://${req.get('host')}/drive/stream?id=${encodeURIComponent(f.id)}`,
+        drive: true
+      }
+    }));
+    res.json({ data: out });
+  } catch (e) {
+    console.error('Drive list failed:', e);
+    res.status(502).json({ data: [] });
+  }
+});
+
+// Edit metadata for a Drive file
+app.post('/drive/edit', (req, res) => {
+  const { id, albumName, artistName, artworkUrl } = req.body;
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+  const meta = loadMetadata();
+  meta[id] = meta[id] || {};
+  if (albumName !== undefined) meta[id].albumName = albumName;
+  if (artistName !== undefined) meta[id].artistName = artistName;
+  if (artworkUrl !== undefined) meta[id].artworkUrl = artworkUrl;
+  saveMetadata(meta);
+  res.json({ id, meta: meta[id] });
+});
+
+// Library endpoint: combine local uploads and Drive files
+app.get('/library', async (req, res) => {
+  try {
+    const localFiles = fs.readdirSync(UPLOADS_DIR).map(name => {
+      const stat = fs.statSync(path.join(UPLOADS_DIR, name));
+      return {
+        type: 'songs',
+        id: `local:${name}`,
+        attributes: {
+          name,
+          artistName: 'Uploaded',
+          albumName: null,
+          durationInMillis: null,
+          artwork: { url: null, width: 600, height: 600 },
+          playUrl: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`
+        }
+      };
+    });
+
+    const c = createDriveClient();
+    let driveFiles = [];
+    if (c) {
+      try {
+        await c.jwtClient.authorize();
+        const resp = await c.drive.files.list({ q: `'${c.folderId}' in parents and trashed=false`, fields: 'files(id,name,mimeType,size,thumbnailLink,createdTime,modifiedTime)', pageSize: 200 });
+        const meta = loadMetadata();
+        driveFiles = (resp.data.files || []).map(f => ({
+          type: 'songs',
+          id: f.id,
+          attributes: {
+            name: f.name,
+            artistName: meta[f.id]?.artistName || 'Unknown',
+            albumName: meta[f.id]?.albumName || null,
+            durationInMillis: null,
+            artwork: { url: meta[f.id]?.artworkUrl || f.thumbnailLink || null, width: 600, height: 600 },
+            playUrl: `${req.protocol}://${req.get('host')}/drive/stream?id=${encodeURIComponent(f.id)}`
+          }
+        }));
+      } catch (e) { console.warn('Drive library load failed', e); }
+    }
+
+    res.json({ data: [...localFiles, ...driveFiles] });
+  } catch (e) {
+    console.error('Library failed:', e);
+    res.status(500).json({ data: [] });
+  }
+});
+
 
 app.get("/search", async (req, res) => {
   let q = req.query.q;
