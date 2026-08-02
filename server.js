@@ -104,6 +104,27 @@ function initR2() {
 
 initR2();
 
+// ---------- Admin auth ----------
+// Protects mutating routes (upload, edit metadata, delete) with a shared
+// secret set via the ADMIN_TOKEN env var in Railway. Not a full auth
+// system — just enough to stop casual/automated abuse of a public URL.
+// Frontend sends it as: Authorization: Bearer <token>
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    // No token configured — fail closed rather than silently allowing
+    // writes, so a forgotten env var doesn't leave the bucket wide open.
+    return res.status(503).json({ error: "Admin actions are disabled: ADMIN_TOKEN not configured on the server" });
+  }
+  const header = req.headers.authorization || "";
+  const provided = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (provided !== ADMIN_TOKEN) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  next();
+}
+
 const AUDIO_VIDEO_EXT = /\.(mp3|mp4|wav|m4a|flac|ogg|aac|mov|mkv|webm)$/i;
 const IMAGE_EXT = /\.(jpg|jpeg|png|webp|gif)$/i;
 
@@ -311,6 +332,7 @@ app.get("/stream", async (req, res) => {
 
 app.post(
   "/upload",
+  requireAdmin,
   (req, res, next) => {
     upload.single("file")(req, res, (err) => {
       if (err) {
@@ -395,7 +417,7 @@ app.post(
 
 // ---------- Edit metadata for a track ----------
 
-app.post("/drive/edit", (req, res) => {
+app.post("/drive/edit", requireAdmin, (req, res) => {
   const { id, albumName, artistName, artworkUrl, name } = req.body;
   if (!id) return res.status(400).json({ error: "Missing id" });
   const meta = loadMeta();
@@ -410,7 +432,7 @@ app.post("/drive/edit", (req, res) => {
 
 // ---------- Delete a track + its metadata ----------
 
-app.delete("/drive/:id", async (req, res) => {
+app.delete("/drive/:id", requireAdmin, async (req, res) => {
   try {
     if (!s3) return res.status(500).json({ error: "R2 not configured" });
     const objectKey = decodeURIComponent(req.params.id);
