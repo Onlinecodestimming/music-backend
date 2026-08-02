@@ -3,265 +3,65 @@ import cors from "cors";
 import fetch from "node-fetch";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
-import { spawn } from "child_process";
+import multer from "multer";
 import fs from "fs";
-import os from "os";
 import path from "path";
+import { fileURLToPath } from "url";
 import { google } from "googleapis";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
+const PORT = process.env.PORT || 8080;
+
+// basic security + CORS
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
+// rate limit
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30 // limit per IP
+  windowMs: 60 * 1000,
+  max: 60
 });
 app.use(limiter);
 
-const cache = new Map();
+// static frontend
+app.use(express.static(path.join(__dirname, "public")));
 
-// uploads directory for user-provided files
-const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// uploads folder
+const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+app.use("/uploads", express.static(uploadDir));
 
-import multer from 'multer';
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const safe = Date.now() + '_' + file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-    cb(null, safe);
-  }
-});
-const upload = multer({ storage });
+const upload = multer({ dest: uploadDir });
 
-// Serve uploaded files and allow directory listing via API
-app.use('/uploads', (req, res, next) => {
-  // allow CORS for uploads
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  next();
-});
-app.use('/uploads', express.static(UPLOADS_DIR));
+// ---------- Google Drive setup ----------
 
-// Upload endpoint (multipart/form-data field 'file')
-app.post('/upload', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  const localUrl = `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(req.file.filename)}`;
+let drive = null;
 
-  // If Drive is configured, upload and return drive proxy URL
-  let driveInfo = null;
-  if (DRIVE_ENABLED) {
-    try {
-      driveInfo = await uploadToDrive(path.join(UPLOADS_DIR, req.file.filename), req.file.filename);
-    } catch (e) {
-      console.error('Drive upload error:', e);
-    }
-  }
+function initDrive() {
+  const b64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64;
+  if (!b64) return;
 
-  const driveProxy = driveInfo ? `${req.protocol}://${req.get('host')}/drive/stream?id=${encodeURIComponent(driveInfo.fileId)}` : null;
+  const json = Buffer.from(b64, "base64").toString("utf8");
+  const creds = JSON.parse(json);
 
-  res.json({ filename: req.file.filename, url: localUrl, drive: driveInfo ? { id: driveInfo.fileId, webViewLink: driveInfo.webViewLink, proxyUrl: driveProxy } : null });
-});
+  const auth = new google.auth.GoogleAuth({
+    credentials: creds,
+    scopes: ["https://www.googleapis.com/auth/drive"]
+  });
 
-// List uploaded files
-app.get('/upload/list', (req, res) => {
-  try {
-    const files = fs.readdirSync(UPLOADS_DIR).map(name => {
-      const stat = fs.statSync(path.join(UPLOADS_DIR, name));
-      return {
-        name,
-        url: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`,
-        size: stat.size,
-        mtime: stat.mtime
-      };
-    }).sort((a,b) => b.mtime - a.mtime);
-    res.json({ data: files });
-  } catch (e) {
-    res.status(500).json({ error: 'failed' });
-  }
-});
-
-// If user supplied YTDLP_COOKIES_B64 in env, write it to a temporary cookies file for yt-dlp to use
-let ytdlpCookiesPath = null;
-if (process.env.YTDLP_COOKIES_B64) {
-  try {
-    const buff = Buffer.from(process.env.YTDLP_COOKIES_B64, "base64");
-    ytdlpCookiesPath = path.join(os.tmpdir(), "yt-cookies.txt");
-    fs.writeFileSync(ytdlpCookiesPath, buff, { mode: 0o600 });
-    console.log("Wrote yt-dlp cookies to", ytdlpCookiesPath);
-  } catch (e) {
-    console.error("Failed to write yt-dlp cookies:", e);
-    ytdlpCookiesPath = null;
-  }
+  drive = google.drive({ version: "v3", auth });
 }
 
-// Google Drive helper (service account)
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || null;
-const DRIVE_ENABLED = !!(process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 && DRIVE_FOLDER_ID);
+initDrive();
 
-const createDriveClient = () => {
-  if (!DRIVE_ENABLED) return null;
-  try {
-    const sa = JSON.parse(Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64, 'base64').toString());
-    const jwtClient = new google.auth.JWT(sa.client_email, null, sa.private_key, ['https://www.googleapis.com/auth/drive']);
-    const drive = google.drive({ version: 'v3', auth: jwtClient });
-    return { drive, jwtClient, folderId: DRIVE_FOLDER_ID };
-  } catch (e) {
-    console.error('Failed to create Drive client:', e);
-    return null;
-  }
-};
+// ---------- Search (Deezer) ----------
 
-const uploadToDrive = async (filepath, filename) => {
-  const c = createDriveClient();
-  if (!c) return null;
-  try {
-    const { drive, jwtClient, folderId } = c;
-    await jwtClient.authorize();
-    const resp = await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { body: fs.createReadStream(filepath) },
-      fields: 'id,webViewLink,webContentLink'
-    });
-    const fileId = resp.data.id;
-    // make public
-    try {
-      await drive.permissions.create({ fileId, requestBody: { role: 'reader', type: 'anyone' } });
-    } catch (e) {
-      console.warn('Failed to set public permission on Drive file:', e);
-    }
-    return { fileId, webViewLink: resp.data.webViewLink || `https://drive.google.com/uc?export=download&id=${fileId}` };
-  } catch (e) {
-    console.error('Drive upload failed:', e);
-    return null;
-  }
-};
-
-// Stream a Drive file via service account (proxies to clients)
-app.get('/drive/stream', async (req, res) => {
-  const id = req.query.id;
-  if (!id) return res.status(400).send('Missing id');
-  const c = createDriveClient();
-  if (!c) return res.status(500).send('Drive not configured');
-  try {
-    const { drive, jwtClient } = c;
-    await jwtClient.authorize();
-    const r = await drive.files.get({ fileId: id, alt: 'media' }, { responseType: 'stream' });
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    const mime = (await drive.files.get({ fileId: id, fields: 'mimeType' })).data.mimeType || 'application/octet-stream';
-    res.setHeader('Content-Type', mime);
-    r.data.pipe(res);
-  } catch (e) {
-    console.error('Drive stream failed:', e);
-    res.status(502).send('Drive stream failed');
-  }
-});
-
-// Metadata store for Drive items (local JSON)
-const METADATA_FILE = path.join(UPLOADS_DIR, 'metadata.json');
-const loadMetadata = () => {
-  try {
-    return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')) || {};
-  } catch (e) { return {}; }
-};
-const saveMetadata = (m) => {
-  try { fs.writeFileSync(METADATA_FILE, JSON.stringify(m, null, 2)); } catch (e) { console.error('Failed to save metadata', e); }
-};
-
-// List files in Drive folder with metadata overlay
-app.get('/drive/list', async (req, res) => {
-  const c = createDriveClient();
-  if (!c) return res.json({ data: [] });
-  try {
-    const { drive, jwtClient, folderId } = c;
-    await jwtClient.authorize();
-    const resp = await drive.files.list({ q: `'${folderId}' in parents and trashed=false`, fields: 'files(id,name,mimeType,size,thumbnailLink,createdTime,modifiedTime)', pageSize: 200 });
-    const files = resp.data.files || [];
-    const meta = loadMetadata();
-    const out = files.map(f => ({
-      type: 'songs',
-      id: f.id,
-      attributes: {
-        name: f.name,
-        artistName: meta[f.id]?.artistName || 'Unknown',
-        albumName: meta[f.id]?.albumName || null,
-        durationInMillis: null,
-        artwork: { url: meta[f.id]?.artworkUrl || f.thumbnailLink || null, width: 600, height: 600 },
-        playUrl: `${req.protocol}://${req.get('host')}/drive/stream?id=${encodeURIComponent(f.id)}`,
-        drive: true
-      }
-    }));
-    res.json({ data: out });
-  } catch (e) {
-    console.error('Drive list failed:', e);
-    res.status(502).json({ data: [] });
-  }
-});
-
-// Edit metadata for a Drive file
-app.post('/drive/edit', (req, res) => {
-  const { id, albumName, artistName, artworkUrl } = req.body;
-  if (!id) return res.status(400).json({ error: 'Missing id' });
-  const meta = loadMetadata();
-  meta[id] = meta[id] || {};
-  if (albumName !== undefined) meta[id].albumName = albumName;
-  if (artistName !== undefined) meta[id].artistName = artistName;
-  if (artworkUrl !== undefined) meta[id].artworkUrl = artworkUrl;
-  saveMetadata(meta);
-  res.json({ id, meta: meta[id] });
-});
-
-// Library endpoint: combine local uploads and Drive files
-app.get('/library', async (req, res) => {
-  try {
-    const localFiles = fs.readdirSync(UPLOADS_DIR).map(name => {
-      const stat = fs.statSync(path.join(UPLOADS_DIR, name));
-      return {
-        type: 'songs',
-        id: `local:${name}`,
-        attributes: {
-          name,
-          artistName: 'Uploaded',
-          albumName: null,
-          durationInMillis: null,
-          artwork: { url: null, width: 600, height: 600 },
-          playUrl: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`
-        }
-      };
-    });
-
-    const c = createDriveClient();
-    let driveFiles = [];
-    if (c) {
-      try {
-        await c.jwtClient.authorize();
-        const resp = await c.drive.files.list({ q: `'${c.folderId}' in parents and trashed=false`, fields: 'files(id,name,mimeType,size,thumbnailLink,createdTime,modifiedTime)', pageSize: 200 });
-        const meta = loadMetadata();
-        driveFiles = (resp.data.files || []).map(f => ({
-          type: 'songs',
-          id: f.id,
-          attributes: {
-            name: f.name,
-            artistName: meta[f.id]?.artistName || 'Unknown',
-            albumName: meta[f.id]?.albumName || null,
-            durationInMillis: null,
-            artwork: { url: meta[f.id]?.artworkUrl || f.thumbnailLink || null, width: 600, height: 600 },
-            playUrl: `${req.protocol}://${req.get('host')}/drive/stream?id=${encodeURIComponent(f.id)}`
-          }
-        }));
-      } catch (e) { console.warn('Drive library load failed', e); }
-    }
-
-    res.json({ data: [...localFiles, ...driveFiles] });
-  } catch (e) {
-    console.error('Library failed:', e);
-    res.status(500).json({ data: [] });
-  }
-});
-
+const cache = new Map();
 
 app.get("/search", async (req, res) => {
   let q = req.query.q;
@@ -272,94 +72,53 @@ app.get("/search", async (req, res) => {
 
   if (cache.has(q)) return res.json({ data: cache.get(q) });
 
-  const appleUrl =
-    "https://itunes.apple.com/search?term=" +
-    encodeURIComponent(q) +
-    "&entity=song&limit=10";
+  const deezerUrl = "https://api.deezer.com/search?q=" + encodeURIComponent(q) + "&limit=10";
 
-  let appleData;
+  let deezerData;
   try {
-    appleData = await fetch(appleUrl).then(r => r.json());
+    deezerData = await fetch(deezerUrl).then(r => r.json());
   } catch {
-    appleData = { results: [] };
+    deezerData = { data: [] };
   }
 
-  const ytSearch = async (query) => {
-    const ytUrl =
-      "https://www.youtube.com/results?search_query=" +
-      encodeURIComponent(query);
-
-    const html = await fetch(ytUrl).then(r => r.text());
-    const jsonMatch = html.match(/ytInitialData"\s*:\s*(\{.*?\})\s*[,<]/s);
-    if (!jsonMatch) return [];
-
-    const data = JSON.parse(jsonMatch[1]);
-    const items =
-      data.contents?.twoColumnSearchResultsRenderer?.primaryContents
-        ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
-
-    const out = [];
-
-    for (const item of items) {
-      const v = item.videoRenderer;
-      if (!v) continue;
-
-      out.push({
-        type: "songs",
-        id: v.videoId,
-        attributes: {
-          name: v.title?.runs?.[0]?.text || query,
-          artistName: v.ownerText?.runs?.[0]?.text || "Unknown Artist",
-          albumName: "YouTube",
-          genre: "Unknown",
-          releaseDate: null,
-          durationInMillis: 0,
-          artwork: {
-            url: v.thumbnail?.thumbnails?.slice(-1)[0]?.url,
-            width: 600,
-            height: 600
-          },
-          playUrl: "https://youtube.com/watch?v=" + v.videoId
-        }
-      });
-    }
-
-    return out;
-  };
-
-  // Apple Music returned nothing → YouTube fallback
-  if (!appleData.results || appleData.results.length === 0) {
-    const ytResults = await ytSearch(q);
-    cache.set(q, ytResults);
-    return res.json({ data: ytResults });
-  }
-
-  // Apple Music results → attach YouTube stream
   const results = [];
 
-  for (const track of appleData.results) {
-    const name = track.trackName;
-    const artist = track.artistName;
+  if (!deezerData.data || deezerData.data.length === 0) {
+    cache.set(q, results);
+    return res.json({ data: results });
+  }
 
-    const ytResults = await ytSearch(`${name} ${artist}`);
-    const best = ytResults[0];
+  for (const track of deezerData.data) {
+    const name = track.title;
+    const artist = track.artist && track.artist.name ? track.artist.name : "";
+    const album = track.album && track.album.title ? track.album.title : null;
+
+    let artworkUrl = null;
+    if (track.album) {
+      artworkUrl =
+        track.album.cover_xl ||
+        track.album.cover_big ||
+        track.album.cover_medium ||
+        track.album.cover;
+    }
+
+    const playUrl = track.preview || null;
 
     results.push({
       type: "songs",
-      id: track.trackId,
+      id: track.id,
       attributes: {
-        name: track.trackName,
-        artistName: track.artistName,
-        albumName: track.collectionName,
-        genre: track.primaryGenreName,
-        releaseDate: track.releaseDate,
-        durationInMillis: track.trackTimeMillis,
+        name,
+        artistName: artist,
+        albumName: album,
+        durationInMillis: (track.duration || 0) * 1000,
         artwork: {
-          url: track.artworkUrl100.replace("100x100", "600x600"),
+          url: artworkUrl || null,
           width: 600,
           height: 600
         },
-        playUrl: best ? best.attributes.playUrl : null
+        playUrl,
+        playable: !!playUrl
       }
     });
   }
@@ -368,77 +127,113 @@ app.get("/search", async (req, res) => {
   res.json({ data: results });
 });
 
-app.get("/stream", (req, res) => {
-  const url = req.query.url;
+// ---------- Stream (proxy Deezer preview) ----------
+
+app.get("/stream", async (req, res) => {
+  let url = req.query.url;
   if (!url) return res.status(400).send("Missing URL");
-  if (typeof url !== "string" || !/^https?:\/\//.test(url) || url.length > 2000) return res.status(400).send("Invalid URL");
+  if (typeof url !== "string" || !/^https?:\/\//.test(url) || url.length > 2000)
+    return res.status(400).send("Invalid URL");
 
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.setHeader("Accept-Ranges", "none");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Range,Content-Type");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Range");
+  res.setHeader("Cache-Control", "public, max-age=3600");
 
-  // Prefer m4a when available, fallback to other bestaudio formats. Add common flags for stability.
-  const baseArgs = [
-    "-f", "bestaudio[ext=m4a]/bestaudio/best",
-    "--no-playlist",
-    "--geo-bypass",
-    "--no-check-certificate",
-    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
-    "-o", "-",
-    url
-  ];
-
-  const args = Array.from(baseArgs);
-  if (ytdlpCookiesPath) {
-    // insert cookies flag before output
-    args.unshift(ytdlpCookiesPath);
-    args.unshift("--cookies");
+  try {
+    const upstream = await fetch(url);
+    if (!upstream.ok) return res.status(502).send("Upstream fetch failed");
+    const ctype = upstream.headers.get("content-type") || "audio/mpeg";
+    res.setHeader("Content-Type", ctype);
+    if (upstream.body) upstream.body.pipe(res);
+    else res.end();
+  } catch (e) {
+    console.log("Stream fetch failed:", e);
+    res.status(500).send("Failed to fetch stream");
   }
-
-  let ytdlp = spawn("yt-dlp", args);
-
-  let stderrBuf = "";
-  const handleStderr = (data) => {
-    const s = data.toString();
-    stderrBuf += s;
-    if (stderrBuf.length > 20000) stderrBuf = stderrBuf.slice(-20000);
-    console.log("yt-dlp stderr:", s);
-  };
-
-  ytdlp.stderr.on("data", handleStderr);
-
-  ytdlp.on("error", err => {
-    console.log("yt-dlp failed:", err);
-    // fallback to python -m yt_dlp when yt-dlp binary is not available
-    const py = spawn("python3", ["-m", "yt_dlp", ...args]);
-    py.stderr.on("data", handleStderr);
-    py.stdout.pipe(res);
-    py.on("error", err2 => {
-      console.log("python yt_dlp failed:", err2);
-      if (!res.headersSent) res.status(500).send("yt-dlp is not available on the server");
-    });
-    py.on("close", (code) => {
-      if (code !== 0) {
-        const tail = stderrBuf.split("\n").slice(-12).join("\n");
-        if (!res.headersSent) res.status(502).send("yt-dlp failed: " + tail);
-      }
-      try { res.end(); } catch {}
-    });
-  });
-
-  // Pipe stdout to client
-  ytdlp.stdout.pipe(res);
-
-  // on close, return error if non-zero
-  ytdlp.on("close", (code) => {
-    if (code !== 0) {
-      const tail = stderrBuf.split("\n").slice(-12).join("\n");
-      if (!res.headersSent) res.status(502).send("yt-dlp failed: " + tail);
-      try { res.end(); } catch {}
-      return;
-    }
-    try { res.end(); } catch {}
-  });
 });
 
-app.listen(process.env.PORT || 8080, () => console.log("Backend running on port", process.env.PORT || 8080));
+// ---------- Upload to local + Drive ----------
+
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const localPath = req.file.path;
+    const filename = req.file.originalname;
+
+    let driveFileId = null;
+    if (drive && process.env.DRIVE_FOLDER_ID) {
+      const resDrive = await drive.files.create({
+        requestBody: {
+          name: filename,
+          parents: [process.env.DRIVE_FOLDER_ID]
+        },
+        media: {
+          mimeType: "application/octet-stream",
+          body: fs.createReadStream(localPath)
+        }
+      });
+      driveFileId = resDrive.data.id;
+    }
+
+    res.json({
+      localUrl: `/uploads/${req.file.filename}`,
+      driveFileId
+    });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// ---------- List Drive files (Browse) ----------
+
+app.get("/drive/list", async (req, res) => {
+  try {
+    if (!drive || !process.env.DRIVE_FOLDER_ID)
+      return res.status(500).json({ error: "Drive not configured" });
+
+    const r = await drive.files.list({
+      q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`,
+      fields: "files(id, name, mimeType, size)"
+    });
+
+    res.json({ files: r.data.files || [] });
+  } catch (err) {
+    console.error("Drive list error:", err);
+    res.status(500).json({ error: "Failed to list Drive files" });
+  }
+});
+
+// ---------- Stream existing Drive file ----------
+
+app.get("/drive/:id", async (req, res) => {
+  try {
+    if (!drive) return res.status(500).json({ error: "Drive not configured" });
+
+    const fileId = req.params.id;
+
+    const driveRes = await drive.files.get(
+      { fileId, alt: "media" },
+      { responseType: "stream" }
+    );
+
+    res.setHeader("Content-Type", "application/octet-stream");
+    driveRes.data.pipe(res);
+  } catch (err) {
+    console.error("Drive read error:", err);
+    res.status(500).json({ error: "Failed to read Drive file" });
+  }
+});
+
+// ---------- Root ----------
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
