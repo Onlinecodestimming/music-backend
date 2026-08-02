@@ -523,16 +523,19 @@ app.get('/upload/list', async (req, res) => {
 // ---------- Library endpoint (combine) ----------
 app.get('/library', async (req, res) => {
   try {
+    const meta = loadMeta();
     const local = fs.readdirSync(uploadDir).filter(n => n !== 'metadata.json').map(name => {
+      const id = `local:${name}`;
+      const m = meta[id] || {};
       return {
         type: 'songs',
-        id: `local:${name}`,
+        id,
         attributes: {
-          name,
-          artistName: 'Uploaded',
-          albumName: null,
+          name: m.name || name,
+          artistName: m.artistName || 'Uploaded',
+          albumName: m.albumName || null,
           durationInMillis: null,
-          artwork: { url: null, width: 600, height: 600 },
+          artwork: { url: m.artworkUrl || null, width: 600, height: 600 },
           playUrl: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`,
           drive: false
         }
@@ -543,19 +546,23 @@ app.get('/library', async (req, res) => {
     if (drive && process.env.DRIVE_FOLDER_ID) {
       try {
         const r = await drive.files.list({ q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`, fields: 'files(id,name,size,thumbnailLink)' });
-        driveFiles = (r.data.files || []).map(f => ({
-          type: 'songs',
-          id: f.id,
-          attributes: {
-            name: f.name,
-            artistName: 'Drive',
-            albumName: null,
-            durationInMillis: null,
-            artwork: { url: f.thumbnailLink || null, width: 600, height: 600 },
-            playUrl: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`,
-            drive: true
-          }
-        }));
+        driveFiles = (r.data.files || []).map(f => {
+          const id = f.id;
+          const m = meta[id] || {};
+          return {
+            type: 'songs',
+            id,
+            attributes: {
+              name: m.name || f.name,
+              artistName: m.artistName || 'Drive',
+              albumName: m.albumName || null,
+              durationInMillis: null,
+              artwork: { url: m.artworkUrl || f.thumbnailLink || null, width: 600, height: 600 },
+              playUrl: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`,
+              drive: true
+            }
+          };
+        });
       } catch (e) { console.warn('Drive list in library failed', e); }
     }
 
@@ -565,20 +572,24 @@ app.get('/library', async (req, res) => {
           try {
             const cmd = new ListObjectsV2Command({ Bucket: r2Client._r2Bucket, Prefix: '', MaxKeys: 200 });
             const out = await r2Client.send(cmd);
-            r2Files = (out.Contents || []).map(o => ({
-              type: 'songs',
-              id: `r2:${o.Key}`,
-              attributes: {
-                name: path.basename(o.Key),
-                artistName: 'R2',
-                albumName: null,
-                durationInMillis: null,
-                artwork: { url: null, width: 600, height: 600 },
-                playUrl: `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(o.Key)}`,
-                drive: false,
-                r2: true
-              }
-            }));
+            r2Files = (out.Contents || []).map(o => {
+              const id = `r2:${o.Key}`;
+              const m = meta[id] || {};
+              return {
+                type: 'songs',
+                id,
+                attributes: {
+                  name: m.name || path.basename(o.Key),
+                  artistName: m.artistName || 'R2',
+                  albumName: m.albumName || null,
+                  durationInMillis: null,
+                  artwork: { url: m.artworkUrl || null, width: 600, height: 600 },
+                  playUrl: `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(o.Key)}`,
+                  drive: false,
+                  r2: true
+                }
+              };
+            });
           } catch (e) { console.warn('R2 list in library failed', e); }
         }
 
