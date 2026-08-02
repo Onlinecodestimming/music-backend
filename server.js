@@ -419,6 +419,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       } catch (e) {
         console.error('Drive upload failed:', e);
       }
+    }
     // cleanup temp file
     fs.unlink(localPath, () => {});
 
