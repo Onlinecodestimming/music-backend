@@ -82,9 +82,27 @@ const upload = multer({
 // R2 is S3-compatible, so the standard AWS SDK v3 S3 client works
 // against it directly — just point endpoint at the R2 account URL.
 
-// R2 client initialization moved below to avoid duplicate function names in merged code.
-// r2Client is initialized later in the file by initR2() that sets r2Client and r2Client._r2Bucket.
+let s3 = null;
+const R2_BUCKET = process.env.R2_BUCKET_NAME;
 
+function initR2() {
+  const accountId = process.env.R2_ACCOUNT_ID;
+  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+
+  if (!accountId || !accessKeyId || !secretAccessKey || !R2_BUCKET) {
+    console.warn("R2 env vars incomplete — storage disabled. Need R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME");
+    return;
+  }
+
+  s3 = new S3Client({
+    region: "auto",
+    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId, secretAccessKey }
+  });
+}
+
+initR2();
 
 const AUDIO_VIDEO_EXT = /\.(mp3|mp4|wav|m4a|flac|ogg|aac|mov|mkv|webm)$/i;
 const IMAGE_EXT = /\.(jpg|jpeg|png|webp|gif)$/i;
@@ -160,9 +178,9 @@ const saveMeta = (m) => {
     console.error("meta save failed", e);
   }
   // best-effort mirror to R2; failures here shouldn't break the request
-  if (r2Client) {
-    r2Client.send(new PutObjectCommand({
-      Bucket: r2Client._r2Bucket,
+  if (s3) {
+    s3.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
       Key: METADATA_R2_KEY,
       Body: JSON.stringify(m, null, 2),
       ContentType: "application/json"
@@ -171,10 +189,10 @@ const saveMeta = (m) => {
 };
 
 async function restoreMetaFromR2() {
-  if (!r2Client) return;
+  if (!s3) return;
   try {
-    const cmd = new GetObjectCommand({ Bucket: r2Client._r2Bucket, Key: METADATA_R2_KEY });
-    const res = await r2Client.send(cmd);
+    const cmd = new GetObjectCommand({ Bucket: R2_BUCKET, Key: METADATA_R2_KEY });
+    const res = await s3.send(cmd);
     const body = await res.Body.transformToString();
     fs.writeFileSync(METADATA_FILE, body);
     console.log("Restored metadata.json from R2");
@@ -184,62 +202,6 @@ async function restoreMetaFromR2() {
   }
 }
 await restoreMetaFromR2();
-
-// ---------- Cloudflare R2 (S3-compatible) setup ----------
-let r2Client = null;
-// AWS SDK S3 client and command classes are imported statically at top of file
-// (avoid dynamic import here to prevent duplicate declaration in ESM).
-
-function initR2() {
-  const key = process.env.R2_ACCESS_KEY_ID || process.env.R2_KEY_ID || process.env.R2_KEY;
-  const secret = process.env.R2_SECRET_ACCESS_KEY || process.env.R2_KEY_SECRET || process.env.R2_SECRET;
-  const endpoint = process.env.R2_ENDPOINT; // e.g. https://<account>.r2.cloudflarestorage.com
-  const bucket = process.env.R2_BUCKET;
-  if (!key || !secret || !endpoint || !bucket) return;
-
-  r2Client = new S3Client({
-    endpoint,
-    region: 'auto',
-    credentials: { accessKeyId: key, secretAccessKey: secret },
-    forcePathStyle: false
-  });
-  r2Client._r2Bucket = bucket;
-}
-
-initR2();
-
-// Simple admin middleware: check Authorization: Bearer <ADMIN_TOKEN>
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
-function isAdmin(req, res, next) {
-  if (!ADMIN_TOKEN) return res.status(403).json({ error: 'Admin not configured' });
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : (req.query.admin_token || null);
-  if (token === ADMIN_TOKEN) return next();
-  return res.status(403).json({ error: 'Forbidden' });
-}
-
-// Helper: stream S3 object (supports Range)
-async function streamR2Object(req, res, key) {
-  if (!r2Client) return res.status(500).json({ error: 'R2 not configured' });
-  const range = req.headers.range;
-  const params = { Bucket: r2Client._r2Bucket, Key: key };
-  if (range) params.Range = range;
-  try {
-    const cmd = new GetObjectCommand(params);
-    const data = await r2Client.send(cmd);
-    // data.Body is a stream
-    // set headers
-    if (data.ContentType) res.setHeader('Content-Type', data.ContentType);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Range,Content-Type');
-    if (range) res.status(206);
-    data.Body.pipe(res);
-  } catch (e) {
-    console.error('R2 get object failed', e);
-    res.status(502).json({ error: 'R2 fetch failed' });
-  }
-}
 
 // ---------- Search (Deezer) ----------
 
@@ -347,178 +309,95 @@ app.get("/stream", async (req, res) => {
 
 // ---------- Upload (R2 is primary storage) ----------
 
-app.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    const localPath = req.file.path;
-    const filename = req.body.title?.trim() || req.file.originalname;
-    const artwork = req.body.artwork || req.body.artworkUrl || null;
-    const artistName = req.body.artistName || null;
-    const albumName = req.body.albumName || null;
-
-    let driveFileId = null;
-    let driveUrl = null;
-    let r2Key = null;
-    let r2Url = null;
-
-    // Upload to R2 if configured
-    if (r2Client) {
-      try {
-        // generate dest key: uploads/<timestamp>-originalname
-        const destKey = `uploads/${Date.now()}-${req.file.originalname}`;
-        await uploadToR2(localPath, destKey, req.file.mimetype || 'application/octet-stream');
-        r2Key = destKey;
-        r2Url = `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(destKey)}`;
-        // store metadata
-        const meta = loadMeta();
-        meta[`r2:${destKey}`] = meta[`r2:${destKey}`] || {};
-        meta[`r2:${destKey}`].name = filename;
-        if (artwork) meta[`r2:${destKey}`].artworkUrl = artwork;
-        if (artistName) meta[`r2:${destKey}`].artistName = artistName;
-        if (albumName) meta[`r2:${destKey}`].albumName = albumName;
-        saveMeta(meta);
-      } catch (e) {
-        console.error('R2 upload failed', e);
+app.post(
+  "/upload",
+  (req, res, next) => {
+    upload.single("file")(req, res, (err) => {
+      if (err) {
+        console.error("Multer error:", err.message);
+        return res.status(400).json({ error: err.message });
       }
-    }
-
-    // If Drive configured, upload and try to make public; save metadata mapping
-    if (drive && process.env.DRIVE_FOLDER_ID) {
-      try {
-        const resDrive = await drive.files.create({
-          requestBody: {
-            name: filename,
-            parents: [process.env.DRIVE_FOLDER_ID]
-          },
-          media: {
-            mimeType: req.file.mimetype || "application/octet-stream",
-            body: fs.createReadStream(localPath)
-          },
-          fields: 'id,webViewLink,webContentLink'
-        });
-        driveFileId = resDrive.data.id;
-        // attempt to set public permission so direct download URL can be used
-        try {
-          await drive.permissions.create({ fileId: driveFileId, requestBody: { role: 'reader', type: 'anyone' } });
-          driveUrl = `https://drive.google.com/uc?export=download&id=${driveFileId}`;
-        } catch (e) {
-          console.warn('Failed to set public permission on Drive file', e);
-          // fallback to proxy URL
-          driveUrl = `${req.protocol}://${req.get('host')}/drive/${driveFileId}`;
-        }
-
-        // store metadata
-        const meta = loadMeta();
-        meta[driveFileId] = meta[driveFileId] || {};
-        meta[driveFileId].name = filename;
-        if (artwork) meta[driveFileId].artworkUrl = artwork;
-        if (artistName) meta[driveFileId].artistName = artistName;
-        if (albumName) meta[driveFileId].albumName = albumName;
-        saveMeta(meta);
-      } catch (e) {
-        console.error('Drive upload failed:', e);
-      }
-    }
-    // cleanup temp file
-    fs.unlink(localPath, () => {});
-
-    res.json({
-      localUrl: `/uploads/${req.file.filename}`,
-      driveFileId,
-      driveUrl,
-      r2Key,
-      r2Url
+      next();
     });
-  } catch (err) {
-    console.error("Upload error:", err);
-    if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
-    res.status(500).json({ error: "Upload failed", detail: err.message });
+  },
+  async (req, res) => {
+    let localPath;
+    try {
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+      localPath = req.file.path;
+      const filename = req.body.title?.trim() || req.file.originalname;
+      const artistName = req.body.artistName?.trim() || null;
+      const albumName = req.body.albumName?.trim() || null;
+      const artwork = req.body.artwork || req.body.artworkUrl || null;
+
+      if (!s3 || !R2_BUCKET) {
+        fs.unlink(localPath, () => {});
+        return res.status(500).json({ error: "R2 storage is not configured on the server" });
+      }
+
+      const ext = path.extname(req.file.originalname) || "";
+      const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+
+      // If an album name is given, upload into that folder so it groups
+      // with any other tracks (and cover image) sharing the same album.
+      // Sanitized to prevent path traversal (../) and to keep keys clean.
+      const safeAlbumFolder = albumName
+        ? albumName.replace(/[^a-zA-Z0-9-_ ]/g, "").trim().replace(/\s+/g, " ")
+        : null;
+      const objectKey = safeAlbumFolder
+        ? `tracks/${safeAlbumFolder}/${uniqueName}`
+        : `tracks/${uniqueName}`;
+
+      const contentType = req.file.mimetype || mime.lookup(req.file.originalname) || "application/octet-stream";
+
+      try {
+        const fileStream = fs.createReadStream(localPath);
+        const stat = fs.statSync(localPath);
+
+        await s3.send(new PutObjectCommand({
+          Bucket: R2_BUCKET,
+          Key: objectKey,
+          Body: fileStream,
+          ContentType: contentType,
+          ContentLength: stat.size
+        }));
+
+        const meta = loadMeta();
+        meta[objectKey] = {
+          name: filename,
+          mimeType: contentType,
+          size: stat.size
+        };
+        if (artistName) meta[objectKey].artistName = artistName;
+        if (albumName) meta[objectKey].albumName = albumName;
+        if (artwork) meta[objectKey].artworkUrl = artwork;
+        saveMeta(meta);
+
+        const driveUrl = `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(objectKey)}`;
+
+        res.json({ driveFileId: objectKey, driveUrl });
+      } catch (e) {
+        console.error("R2 upload failed:", e.message);
+        return res.status(502).json({ error: "Upload to R2 failed" });
+      } finally {
+        fs.unlink(localPath, (err) => {
+          if (err) console.warn("Failed to remove temp file:", err.message);
+        });
+      }
+    } catch (err) {
+      console.error("Upload error:", err);
+      if (localPath) fs.unlink(localPath, () => {});
+      res.status(500).json({ error: "Upload failed" });
+    }
   }
-});
+);
 
 // ---------- Edit metadata for a track ----------
 
-app.get("/drive/list", async (req, res) => {
-  try {
-    if (!drive || !process.env.DRIVE_FOLDER_ID)
-      return res.status(500).json({ error: "Drive not configured" });
-
-    const r = await drive.files.list({
-      q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`,
-      fields: "files(id, name, mimeType, size, thumbnailLink)"
-    });
-
-    const files = (r.data.files || []).map(f => ({
-      id: f.id,
-      name: f.name,
-      size: f.size,
-      mimeType: f.mimeType,
-      thumbnail: f.thumbnailLink || null,
-      url: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`
-    }));
-
-    res.json({ data: files });
-  } catch (err) {
-    console.error("Drive list error:", err);
-    res.status(500).json({ error: "Failed to list Drive files" });
-  }
-});
-
-// ---------- R2 list and stream ----------
-app.get('/r2/list', async (req, res) => {
-  try {
-    if (!r2Client) return res.status(500).json({ error: 'R2 not configured' });
-    const params = { Bucket: r2Client._r2Bucket, Prefix: '', MaxKeys: 200 };
-    const cmd = new ListObjectsV2Command(params);
-    const out = await r2Client.send(cmd);
-    const items = (out.Contents || []).map(o => ({
-      key: o.Key,
-      size: o.Size,
-      lastModified: o.LastModified,
-      url: `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(o.Key)}`
-    }));
-    res.json({ data: items });
-  } catch (e) {
-    console.error('R2 list failed', e);
-    res.status(500).json({ error: 'R2 list failed' });
-  }
-});
-
-// Stream R2 object (supports range)
-app.get('/r2/:key', async (req, res) => {
-  const key = req.params.key;
-  if (!key) return res.status(400).send('Missing key');
-  await streamR2Object(req, res, key);
-});
-
-// Upload to R2 (optional) - used by POST /upload below when R2 is configured
-async function uploadToR2(localPath, destKey, contentType) {
-  if (!r2Client) throw new Error('R2 not configured');
-  const body = fs.createReadStream(localPath);
-  const cmd = new PutObjectCommand({ Bucket: r2Client._r2Bucket, Key: destKey, Body: body, ContentType: contentType });
-  const r = await r2Client.send(cmd);
-  return r;
-}
-
-// Delete R2 object
-async function deleteR2Key(key) {
-  if (!r2Client) throw new Error('R2 not configured');
-  const cmd = new DeleteObjectCommand({ Bucket: r2Client._r2Bucket, Key: key });
-  return r2Client.send(cmd);
-}
-
-// ---------- Metadata store (simple JSON) ----------
-const METADATA_FILE = path.join(uploadDir, 'metadata.json');
-const loadMeta = () => {
-  try { return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')); } catch (e) { return {}; }
-};
-const saveMeta = (m) => { try { fs.writeFileSync(METADATA_FILE, JSON.stringify(m, null, 2)); } catch (e) { console.error('meta save failed', e); } };
-
-// Edit metadata for a file (local, drive id, or r2:id) - admin only
-app.post('/drive/edit', isAdmin, express.json(), (req, res) => {
+app.post("/drive/edit", (req, res) => {
   const { id, albumName, artistName, artworkUrl, name } = req.body;
-  if (!id) return res.status(400).json({ error: 'Missing id' });
+  if (!id) return res.status(400).json({ error: "Missing id" });
   const meta = loadMeta();
   meta[id] = meta[id] || {};
   if (name !== undefined) meta[id].name = name;
@@ -529,130 +408,22 @@ app.post('/drive/edit', isAdmin, express.json(), (req, res) => {
   res.json({ id, meta: meta[id] });
 });
 
-// Delete Drive file (admin)
-app.delete('/drive/:id', isAdmin, async (req, res) => {
-  try {
-    if (!drive) return res.status(500).json({ error: 'Drive not configured' });
-    const fileId = req.params.id;
-    await drive.files.delete({ fileId });
-    // remove metadata entry if exists
-    const meta = loadMeta(); delete meta[fileId]; saveMeta(meta);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Drive delete failed', e);
-    res.status(500).json({ error: 'Delete failed' });
-  }
-});
+// ---------- Delete a track + its metadata ----------
 
-// Delete R2 object (admin)
-app.delete('/r2/:key', isAdmin, async (req, res) => {
+app.delete("/drive/:id", async (req, res) => {
   try {
-    if (!r2Client) return res.status(500).json({ error: 'R2 not configured' });
-    const key = req.params.key;
-    await deleteR2Key(key);
-    const meta = loadMeta(); delete meta[`r2:${key}`]; saveMeta(meta);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('R2 delete failed', e);
-    res.status(500).json({ error: 'Delete failed' });
-  }
-});
+    if (!s3) return res.status(500).json({ error: "R2 not configured" });
+    const objectKey = decodeURIComponent(req.params.id);
 
-// Delete local upload (admin)
-app.delete('/uploads/:name', isAdmin, (req, res) => {
-  try {
-    const name = req.params.name;
-    const p = path.join(uploadDir, name);
-    if (fs.existsSync(p)) fs.unlinkSync(p);
-    const meta = loadMeta(); delete meta[`local:${name}`]; saveMeta(meta);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Local delete failed', e);
-    res.status(500).json({ error: 'Delete failed' });
-  }
-});
+    await s3.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: objectKey }));
 
-// Artist page: list tracks and artist metadata
-app.get('/artists/:name', async (req, res) => {
-  try {
-    const name = req.params.name;
-    const all = [];
-    // local
-    const local = fs.readdirSync(uploadDir).filter(n => n !== 'metadata.json');
-    local.forEach(n => all.push({ id: `local:${n}`, name: n, url: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(n)}`, source: 'local' }));
-    // drive
-    if (drive && process.env.DRIVE_FOLDER_ID) {
-      try {
-        const r = await drive.files.list({ q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`, fields: 'files(id,name,thumbnailLink)' });
-        (r.data.files || []).forEach(f => all.push({ id: f.id, name: f.name, url: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`, source: 'drive' }));
-      } catch (e) { console.warn('Drive list failed in artists', e); }
-    }
-    // r2
-    if (r2Client) {
-      try {
-        const cmd = new ListObjectsV2Command({ Bucket: r2Client._r2Bucket, Prefix: '', MaxKeys: 200 });
-        const out = await r2Client.send(cmd);
-        (out.Contents || []).forEach(o => all.push({ id: `r2:${o.Key}`, name: path.basename(o.Key), url: `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(o.Key)}`, source: 'r2' }));
-      } catch (e) { console.warn('R2 list failed in artists', e); }
-    }
-
-    // filter by metadata artistName or filename contains
     const meta = loadMeta();
-    const matches = all.filter(item => {
-      const m = meta[item.id] || {};
-      if (m.artistName && m.artistName.toLowerCase() === name.toLowerCase()) return true;
-      return (item.name || '').toLowerCase().includes(name.toLowerCase());
-    });
-
-    const artistMeta = meta[`artist:${name}`] || {};
-    res.json({ artist: artistMeta, data: matches });
-  } catch (e) {
-    console.error('Artists endpoint failed', e);
-    res.status(500).json({ error: 'Failed' });
-  }
-});
-
-// Edit artist metadata (admin)
-app.post('/artist/edit', isAdmin, express.json(), (req, res) => {
-  const { name, displayName, profileUrl } = req.body;
-  if (!name) return res.status(400).json({ error: 'Missing name' });
-  const meta = loadMeta();
-  meta[`artist:${name}`] = meta[`artist:${name}`] || {};
-  if (displayName !== undefined) meta[`artist:${name}`].displayName = displayName;
-  if (profileUrl !== undefined) meta[`artist:${name}`].profileUrl = profileUrl;
-  saveMeta(meta);
-  res.json({ ok: true, artist: meta[`artist:${name}`] });
-});
-
-// ---------- List local uploads ----------
-app.get('/upload/list', async (req, res) => {
-  try {
-    const files = [];
-    // local uploads
-    const all = fs.readdirSync(uploadDir).filter(n => n !== 'metadata.json');
-    for (const name of all) {
-      const stat = fs.statSync(path.join(uploadDir, name));
-      files.push({ id: `local:${name}`, name, size: stat.size, url: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`, thumbnail: null });
+    if (meta[objectKey]) {
+      delete meta[objectKey];
+      saveMeta(meta);
     }
 
-    // drive items
-    if (drive && process.env.DRIVE_FOLDER_ID) {
-      try {
-        const r = await drive.files.list({ q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`, fields: 'files(id,name,size,thumbnailLink)' });
-        (r.data.files || []).forEach(f => files.push({ id: f.id, name: f.name, size: f.size, url: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`, thumbnail: f.thumbnailLink || null }));
-      } catch (e) { console.warn('Drive list failed in upload/list', e); }
-    }
-
-    // r2 items
-    if (r2Client) {
-      try {
-        const cmd = new ListObjectsV2Command({ Bucket: r2Client._r2Bucket, Prefix: '', MaxKeys: 200 });
-        const out = await r2Client.send(cmd);
-        (out.Contents || []).forEach(o => files.push({ id: `r2:${o.Key}`, name: path.basename(o.Key), size: o.Size, url: `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(o.Key)}`, thumbnail: null }));
-      } catch (e) { console.warn('R2 list failed in upload/list', e); }
-    }
-
-    res.json({ data: files });
+    res.json({ deleted: true, id: objectKey });
   } catch (err) {
     console.error("R2 delete error:", err.message);
     res.status(500).json({ error: "Failed to delete file" });
@@ -689,77 +460,41 @@ async function listAllObjects() {
 
 app.get("/library", async (req, res) => {
   try {
+    if (!s3 || !R2_BUCKET) {
+      return res.status(500).json({ error: "R2 not configured", data: [] });
+    }
+
+    const allObjects = await listAllObjects();
     const meta = loadMeta();
-    const local = fs.readdirSync(uploadDir).filter(n => n !== 'metadata.json').map(name => {
-      const id = `local:${name}`;
-      const m = meta[id] || {};
+    const { tracks } = groupByAlbumFolder(allObjects);
+
+    const files = tracks.map(obj => {
+      const m = meta[obj.Key] || {};
+      const folderName = obj._folderPath ? obj._folderPath.split("/").pop() : null;
+      const coverUrl = m.artworkUrl
+        || (obj._coverKey ? `${req.protocol}://${req.get("host")}/cover/${encodeURIComponent(obj._coverKey)}` : null);
+
       return {
-        type: 'songs',
-        id,
+        type: "songs",
+        id: obj.Key,
         attributes: {
-          name: m.name || name,
-          artistName: m.artistName || 'Uploaded',
-          albumName: m.albumName || null,
+          name: m.name || obj.Key.split("/").pop(),
+          artistName: m.artistName || "Unknown",
+          albumName: m.albumName || folderName || null,
           durationInMillis: null,
-          artwork: { url: m.artworkUrl || null, width: 600, height: 600 },
-          playUrl: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`,
-          drive: false
+          artwork: {
+            url: coverUrl,
+            width: 600,
+            height: 600
+          },
+          playUrl: `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(obj.Key)}`,
+          mimeType: m.mimeType || mime.lookup(obj.Key) || "application/octet-stream",
+          drive: true
         }
       };
     });
 
-    let driveFiles = [];
-    if (drive && process.env.DRIVE_FOLDER_ID) {
-      try {
-        const r = await drive.files.list({ q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`, fields: 'files(id,name,size,thumbnailLink)' });
-        driveFiles = (r.data.files || []).map(f => {
-          const id = f.id;
-          const m = meta[id] || {};
-          return {
-            type: 'songs',
-            id,
-            attributes: {
-              name: m.name || f.name,
-              artistName: m.artistName || 'Drive',
-              albumName: m.albumName || null,
-              durationInMillis: null,
-              artwork: { url: m.artworkUrl || f.thumbnailLink || null, width: 600, height: 600 },
-              playUrl: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`,
-              drive: true
-            }
-          };
-        });
-      } catch (e) { console.warn('Drive list in library failed', e); }
-    }
-
-        // R2 files
-        let r2Files = [];
-        if (r2Client) {
-          try {
-            const cmd = new ListObjectsV2Command({ Bucket: r2Client._r2Bucket, Prefix: '', MaxKeys: 200 });
-            const out = await r2Client.send(cmd);
-            r2Files = (out.Contents || []).map(o => {
-              const id = `r2:${o.Key}`;
-              const m = meta[id] || {};
-              return {
-                type: 'songs',
-                id,
-                attributes: {
-                  name: m.name || path.basename(o.Key),
-                  artistName: m.artistName || 'R2',
-                  albumName: m.albumName || null,
-                  durationInMillis: null,
-                  artwork: { url: m.artworkUrl || null, width: 600, height: 600 },
-                  playUrl: `${req.protocol}://${req.get('host')}/r2/${encodeURIComponent(o.Key)}`,
-                  drive: false,
-                  r2: true
-                }
-              };
-            });
-          } catch (e) { console.warn('R2 list in library failed', e); }
-        }
-
-        res.json({ data: [...local, ...driveFiles, ...r2Files] });
+    res.json({ data: files });
   } catch (e) {
     console.error("Library failed", e);
     res.status(500).json({ data: [] });
