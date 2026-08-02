@@ -19,8 +19,10 @@ const PORT = process.env.PORT || 8080;
 // basic security + CORS
 app.use(helmet());
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Higher limit than Express's 100kb default — /drive/edit accepts
+// base64-encoded cover images from the frontend's cover-art editor.
+app.use(express.json({ limit: "8mb" }));
+app.use(express.urlencoded({ extended: true, limit: "8mb" }));
 
 // rate limit
 const limiter = rateLimit({
