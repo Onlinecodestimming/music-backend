@@ -82,27 +82,9 @@ const upload = multer({
 // R2 is S3-compatible, so the standard AWS SDK v3 S3 client works
 // against it directly — just point endpoint at the R2 account URL.
 
-let s3 = null;
-const R2_BUCKET = process.env.R2_BUCKET_NAME;
+// R2 client initialization moved below to avoid duplicate function names in merged code.
+// r2Client is initialized later in the file by initR2() that sets r2Client and r2Client._r2Bucket.
 
-function initR2() {
-  const accountId = process.env.R2_ACCOUNT_ID;
-  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-
-  if (!accountId || !accessKeyId || !secretAccessKey || !R2_BUCKET) {
-    console.warn("R2 env vars incomplete — storage disabled. Need R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME");
-    return;
-  }
-
-  s3 = new S3Client({
-    region: "auto",
-    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
-    credentials: { accessKeyId, secretAccessKey }
-  });
-}
-
-initR2();
 
 const AUDIO_VIDEO_EXT = /\.(mp3|mp4|wav|m4a|flac|ogg|aac|mov|mkv|webm)$/i;
 const IMAGE_EXT = /\.(jpg|jpeg|png|webp|gif)$/i;
@@ -178,9 +160,9 @@ const saveMeta = (m) => {
     console.error("meta save failed", e);
   }
   // best-effort mirror to R2; failures here shouldn't break the request
-  if (s3) {
-    s3.send(new PutObjectCommand({
-      Bucket: R2_BUCKET,
+  if (r2Client) {
+    r2Client.send(new PutObjectCommand({
+      Bucket: r2Client._r2Bucket,
       Key: METADATA_R2_KEY,
       Body: JSON.stringify(m, null, 2),
       ContentType: "application/json"
@@ -189,10 +171,10 @@ const saveMeta = (m) => {
 };
 
 async function restoreMetaFromR2() {
-  if (!s3) return;
+  if (!r2Client) return;
   try {
-    const cmd = new GetObjectCommand({ Bucket: R2_BUCKET, Key: METADATA_R2_KEY });
-    const res = await s3.send(cmd);
+    const cmd = new GetObjectCommand({ Bucket: r2Client._r2Bucket, Key: METADATA_R2_KEY });
+    const res = await r2Client.send(cmd);
     const body = await res.Body.transformToString();
     fs.writeFileSync(METADATA_FILE, body);
     console.log("Restored metadata.json from R2");
