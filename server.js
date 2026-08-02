@@ -205,7 +205,8 @@ await restoreMetaFromR2();
 
 // ---------- Cloudflare R2 (S3-compatible) setup ----------
 let r2Client = null;
-const { S3Client, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, DeleteObjectCommand } = await import('@aws-sdk/client-s3');
+// AWS SDK S3 client and command classes are imported statically at top of file
+// (avoid dynamic import here to prevent duplicate declaration in ESM).
 
 function initR2() {
   const key = process.env.R2_ACCESS_KEY_ID || process.env.R2_KEY_ID || process.env.R2_KEY;
