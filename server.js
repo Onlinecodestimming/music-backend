@@ -419,79 +419,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       } catch (e) {
         console.error('Drive upload failed:', e);
       }
-      next();
-    });
-  },
-  async (req, res) => {
-    let localPath;
-    try {
-      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-      localPath = req.file.path;
-      const filename = req.body.title?.trim() || req.file.originalname;
-      const artistName = req.body.artistName?.trim() || null;
-      const albumName = req.body.albumName?.trim() || null;
-      const artwork = req.body.artwork || req.body.artworkUrl || null;
-
-      if (!s3 || !R2_BUCKET) {
-        fs.unlink(localPath, () => {});
-        return res.status(500).json({ error: "R2 storage is not configured on the server" });
-      }
-
-      const ext = path.extname(req.file.originalname) || "";
-      const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-
-      // If an album name is given, upload into that folder so it groups
-      // with any other tracks (and cover image) sharing the same album.
-      // Sanitized to prevent path traversal (../) and to keep keys clean.
-      const safeAlbumFolder = albumName
-        ? albumName.replace(/[^a-zA-Z0-9-_ ]/g, "").trim().replace(/\s+/g, " ")
-        : null;
-      const objectKey = safeAlbumFolder
-        ? `tracks/${safeAlbumFolder}/${uniqueName}`
-        : `tracks/${uniqueName}`;
-
-      const contentType = req.file.mimetype || mime.lookup(req.file.originalname) || "application/octet-stream";
-
-      try {
-        const fileStream = fs.createReadStream(localPath);
-        const stat = fs.statSync(localPath);
-
-        await s3.send(new PutObjectCommand({
-          Bucket: R2_BUCKET,
-          Key: objectKey,
-          Body: fileStream,
-          ContentType: contentType,
-          ContentLength: stat.size
-        }));
-
-        const meta = loadMeta();
-        meta[objectKey] = {
-          name: filename,
-          mimeType: contentType,
-          size: stat.size
-        };
-        if (artistName) meta[objectKey].artistName = artistName;
-        if (albumName) meta[objectKey].albumName = albumName;
-        if (artwork) meta[objectKey].artworkUrl = artwork;
-        saveMeta(meta);
-
-        const driveUrl = `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(objectKey)}`;
-
-        res.json({ driveFileId: objectKey, driveUrl });
-      } catch (e) {
-        console.error("R2 upload failed:", e.message);
-        return res.status(502).json({ error: "Upload to R2 failed" });
-      } finally {
-        fs.unlink(localPath, (err) => {
-          if (err) console.warn("Failed to remove temp file:", err.message);
-        });
-      }
-    } catch (err) {
-      console.error("Upload error:", err);
-      if (localPath) fs.unlink(localPath, () => {});
-      res.status(500).json({ error: "Upload failed" });
-    }
+    // cleanup temp file
+    fs.unlink(localPath, () => {});
 
     res.json({
       localUrl: `/uploads/${req.file.filename}`,
@@ -502,9 +431,10 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     });
   } catch (err) {
     console.error("Upload error:", err);
-    res.status(500).json({ error: "Upload failed" });
+    if (req.file && req.file.path) fs.unlink(req.file.path, () => {});
+    res.status(500).json({ error: "Upload failed", detail: err.message });
   }
-);
+});
 
 // ---------- Edit metadata for a track ----------
 
