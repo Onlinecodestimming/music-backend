@@ -523,6 +523,69 @@ app.get("/library", async (req, res) => {
   }
 });
 
+// ---------- Grouped library: by album and by artist ----------
+// Reuses the same track data as /library, but organized into shelves for
+// Browse. Each group carries a representative cover (the first track's
+// artwork with a cover found) so the frontend can render an album-grid
+// or artist-grid the way Apple Music does, instead of one flat list.
+
+app.get("/library/grouped", async (req, res) => {
+  try {
+    if (!s3 || !R2_BUCKET) {
+      return res.status(500).json({ error: "R2 not configured", albums: [], artists: [] });
+    }
+
+    const allObjects = await listAllObjects();
+    const meta = loadMeta();
+    const { tracks } = groupByAlbumFolder(allObjects);
+
+    const trackAttrs = tracks.map(obj => {
+      const m = meta[obj.Key] || {};
+      const folderName = obj._folderPath ? obj._folderPath.split("/").pop() : null;
+      const coverUrl = m.artworkUrl
+        || (obj._coverKey ? `${req.protocol}://${req.get("host")}/cover/${encodeURIComponent(obj._coverKey)}` : null);
+
+      return {
+        id: obj.Key,
+        name: m.name || obj.Key.split("/").pop(),
+        artistName: m.artistName || "Unknown",
+        albumName: m.albumName || folderName || "Unknown Album",
+        artwork: { url: coverUrl, width: 600, height: 600 },
+        playUrl: `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(obj.Key)}`,
+        mimeType: m.mimeType || mime.lookup(obj.Key) || "application/octet-stream"
+      };
+    });
+
+    // Group by album
+    const albumMap = new Map();
+    for (const t of trackAttrs) {
+      const key = t.albumName;
+      if (!albumMap.has(key)) albumMap.set(key, { name: key, artistName: t.artistName, artwork: null, tracks: [] });
+      const group = albumMap.get(key);
+      group.tracks.push(t);
+      if (!group.artwork && t.artwork.url) group.artwork = t.artwork;
+    }
+
+    // Group by artist
+    const artistMap = new Map();
+    for (const t of trackAttrs) {
+      const key = t.artistName;
+      if (!artistMap.has(key)) artistMap.set(key, { name: key, artwork: null, tracks: [] });
+      const group = artistMap.get(key);
+      group.tracks.push(t);
+      if (!group.artwork && t.artwork.url) group.artwork = t.artwork;
+    }
+
+    const albums = Array.from(albumMap.values());
+    const artists = Array.from(artistMap.values());
+
+    res.json({ albums, artists });
+  } catch (e) {
+    console.error("Grouped library failed", e);
+    res.status(500).json({ albums: [], artists: [] });
+  }
+});
+
 // ---------- Search the bucket by filename / title / artist / album ----------
 // Replaces the old behavior of only searching Deezer's catalog — this
 // searches YOUR uploaded library so you can actually find your own files.
