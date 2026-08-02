@@ -104,6 +104,57 @@ function initR2() {
 
 initR2();
 
+const AUDIO_VIDEO_EXT = /\.(mp3|mp4|wav|m4a|flac|ogg|aac|mov|mkv|webm)$/i;
+const IMAGE_EXT = /\.(jpg|jpeg|png|webp|gif)$/i;
+
+/**
+ * Groups a flat list of S3 objects by their "album folder" — i.e. everything
+ * before the last slash in the key. Files sitting at the bucket root (no
+ * slash) are grouped under an empty-string folder path.
+ *
+ * For each folder, picks a cover image: prefers a file literally named
+ * "cover.*", falls back to the first image found in that folder, falls
+ * back to null (frontend shows a placeholder).
+ *
+ * Returns { tracks: [{...S3 object, _folderPath, _coverKey}], covers: {folderPath: coverObjectKey} }
+ */
+function groupByAlbumFolder(objects) {
+  const folders = new Map(); // folderPath -> { tracks: [], images: [] }
+
+  for (const obj of objects) {
+    const key = obj.Key;
+    if (key === METADATA_R2_KEY) continue; // skip our own metadata backup file
+
+    const lastSlash = key.lastIndexOf("/");
+    const folderPath = lastSlash === -1 ? "" : key.substring(0, lastSlash);
+
+    if (!folders.has(folderPath)) folders.set(folderPath, { tracks: [], images: [] });
+    const bucket = folders.get(folderPath);
+
+    if (AUDIO_VIDEO_EXT.test(key)) {
+      bucket.tracks.push(obj);
+    } else if (IMAGE_EXT.test(key)) {
+      bucket.images.push(obj);
+    }
+  }
+
+  const covers = {};
+  for (const [folderPath, { images }] of folders.entries()) {
+    if (images.length === 0) continue;
+    const named = images.find(img => /(^|\/)cover\.(jpg|jpeg|png|webp|gif)$/i.test(img.Key));
+    covers[folderPath] = (named || images[0]).Key;
+  }
+
+  const tracks = [];
+  for (const [folderPath, { tracks: folderTracks }] of folders.entries()) {
+    for (const t of folderTracks) {
+      tracks.push({ ...t, _folderPath: folderPath, _coverKey: covers[folderPath] || null });
+    }
+  }
+
+  return { tracks, covers };
+}
+
 // ---------- Metadata store (simple JSON, lives in uploadDir) ----------
 // Caches display metadata (custom titles, artist/album/artwork overrides,
 // original filename, mimeType, size) keyed by the R2 object key. This file
@@ -286,7 +337,18 @@ app.post(
       }
 
       const ext = path.extname(req.file.originalname) || "";
-      const objectKey = `tracks/${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+      const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+
+      // If an album name is given, upload into that folder so it groups
+      // with any other tracks (and cover image) sharing the same album.
+      // Sanitized to prevent path traversal (../) and to keep keys clean.
+      const safeAlbumFolder = albumName
+        ? albumName.replace(/[^a-zA-Z0-9-_ ]/g, "").trim().replace(/\s+/g, " ")
+        : null;
+      const objectKey = safeAlbumFolder
+        ? `tracks/${safeAlbumFolder}/${uniqueName}`
+        : `tracks/${uniqueName}`;
+
       const contentType = req.file.mimetype || mime.lookup(req.file.originalname) || "application/octet-stream";
 
       try {
@@ -368,7 +430,33 @@ app.delete("/drive/:id", async (req, res) => {
   }
 });
 
+/**
+ * ListObjectsV2 caps out at 1000 keys per call — this walks all pages
+ * so libraries with more than 1000 objects (tracks + cover images
+ * combined) still show up completely.
+ */
+async function listAllObjects() {
+  let allObjects = [];
+  let continuationToken = undefined;
+
+  do {
+    const res = await s3.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      ContinuationToken: continuationToken
+    }));
+    allObjects = allObjects.concat(res.Contents || []);
+    continuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (continuationToken);
+
+  return allObjects;
+}
+
 // ---------- Library endpoint (R2 is the source of truth) ----------
+// Scans the ENTIRE bucket (not just a "tracks/" prefix) so that files
+// uploaded directly via rclone/dashboard into any folder structure show
+// up here too. Groups objects by their folder path and treats each
+// folder as an "album" — using any cover.jpg/png/etc found in that
+// folder as the artwork for every track inside it.
 
 app.get("/library", async (req, res) => {
   try {
@@ -376,26 +464,26 @@ app.get("/library", async (req, res) => {
       return res.status(500).json({ error: "R2 not configured", data: [] });
     }
 
-    const list = await s3.send(new ListObjectsV2Command({
-      Bucket: R2_BUCKET,
-      Prefix: "tracks/"
-    }));
-
+    const allObjects = await listAllObjects();
     const meta = loadMeta();
-    const objects = list.Contents || [];
+    const { tracks } = groupByAlbumFolder(allObjects);
 
-    const files = objects.map(obj => {
+    const files = tracks.map(obj => {
       const m = meta[obj.Key] || {};
+      const folderName = obj._folderPath ? obj._folderPath.split("/").pop() : null;
+      const coverUrl = m.artworkUrl
+        || (obj._coverKey ? `${req.protocol}://${req.get("host")}/cover/${encodeURIComponent(obj._coverKey)}` : null);
+
       return {
         type: "songs",
         id: obj.Key,
         attributes: {
           name: m.name || obj.Key.split("/").pop(),
           artistName: m.artistName || "Unknown",
-          albumName: m.albumName || null,
+          albumName: m.albumName || folderName || null,
           durationInMillis: null,
           artwork: {
-            url: m.artworkUrl || null,
+            url: coverUrl,
             width: 600,
             height: 600
           },
@@ -410,6 +498,84 @@ app.get("/library", async (req, res) => {
   } catch (e) {
     console.error("Library failed", e);
     res.status(500).json({ data: [] });
+  }
+});
+
+// ---------- Search the bucket by filename / title / artist / album ----------
+// Replaces the old behavior of only searching Deezer's catalog — this
+// searches YOUR uploaded library so you can actually find your own files.
+
+app.get("/library/search", async (req, res) => {
+  try {
+    if (!s3 || !R2_BUCKET) {
+      return res.status(500).json({ error: "R2 not configured", data: [] });
+    }
+
+    let q = (req.query.q || "").toString().trim().toLowerCase();
+    if (!q) return res.json({ data: [] });
+
+    const allObjects = await listAllObjects();
+    const meta = loadMeta();
+    const { tracks } = groupByAlbumFolder(allObjects);
+
+    const matches = tracks.filter(obj => {
+      const m = meta[obj.Key] || {};
+      const folderName = obj._folderPath ? obj._folderPath.split("/").pop() : "";
+      const haystack = [
+        m.name || obj.Key.split("/").pop(),
+        m.artistName || "",
+        m.albumName || folderName || ""
+      ].join(" ").toLowerCase();
+      return haystack.includes(q);
+    });
+
+    const files = matches.map(obj => {
+      const m = meta[obj.Key] || {};
+      const folderName = obj._folderPath ? obj._folderPath.split("/").pop() : null;
+      const coverUrl = m.artworkUrl
+        || (obj._coverKey ? `${req.protocol}://${req.get("host")}/cover/${encodeURIComponent(obj._coverKey)}` : null);
+
+      return {
+        type: "songs",
+        id: obj.Key,
+        attributes: {
+          name: m.name || obj.Key.split("/").pop(),
+          artistName: m.artistName || "Unknown",
+          albumName: m.albumName || folderName || null,
+          durationInMillis: null,
+          artwork: { url: coverUrl, width: 600, height: 600 },
+          playUrl: `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(obj.Key)}`,
+          mimeType: m.mimeType || mime.lookup(obj.Key) || "application/octet-stream",
+          drive: true
+        }
+      };
+    });
+
+    res.json({ data: files });
+  } catch (e) {
+    console.error("Library search failed", e);
+    res.status(500).json({ data: [] });
+  }
+});
+
+// ---------- Serve a cover image from the bucket ----------
+
+app.get("/cover/:key", async (req, res) => {
+  try {
+    if (!s3) return res.status(500).json({ error: "R2 not configured" });
+    const objectKey = decodeURIComponent(req.params.key);
+
+    const head = await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: objectKey }));
+    const mimeType = head.ContentType || mime.lookup(objectKey) || "image/jpeg";
+
+    const obj = await s3.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: objectKey }));
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    obj.Body.pipe(res);
+  } catch (err) {
+    console.error("Cover read error:", err.message);
+    res.status(404).json({ error: "Cover not found" });
   }
 });
 
