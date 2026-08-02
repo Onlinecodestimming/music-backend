@@ -197,13 +197,109 @@ app.get("/drive/list", async (req, res) => {
 
     const r = await drive.files.list({
       q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`,
-      fields: "files(id, name, mimeType, size)"
+      fields: "files(id, name, mimeType, size, thumbnailLink)"
     });
 
-    res.json({ files: r.data.files || [] });
+    const files = (r.data.files || []).map(f => ({
+      id: f.id,
+      name: f.name,
+      size: f.size,
+      mimeType: f.mimeType,
+      thumbnail: f.thumbnailLink || null,
+      url: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`
+    }));
+
+    res.json({ data: files });
   } catch (err) {
     console.error("Drive list error:", err);
     res.status(500).json({ error: "Failed to list Drive files" });
+  }
+});
+
+// ---------- Metadata store (simple JSON) ----------
+const METADATA_FILE = path.join(uploadDir, 'metadata.json');
+const loadMeta = () => {
+  try { return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')); } catch (e) { return {}; }
+};
+const saveMeta = (m) => { try { fs.writeFileSync(METADATA_FILE, JSON.stringify(m, null, 2)); } catch (e) { console.error('meta save failed', e); } };
+
+// Edit metadata for a file (local or drive id)
+app.post('/drive/edit', express.json(), (req, res) => {
+  const { id, albumName, artistName, artworkUrl } = req.body;
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+  const meta = loadMeta();
+  meta[id] = meta[id] || {};
+  if (albumName !== undefined) meta[id].albumName = albumName;
+  if (artistName !== undefined) meta[id].artistName = artistName;
+  if (artworkUrl !== undefined) meta[id].artworkUrl = artworkUrl;
+  saveMeta(meta);
+  res.json({ id, meta: meta[id] });
+});
+
+// ---------- List local uploads ----------
+app.get('/upload/list', (req, res) => {
+  try {
+    const all = fs.readdirSync(uploadDir).filter(n => n !== 'metadata.json');
+    const files = all.map(name => {
+      const stat = fs.statSync(path.join(uploadDir, name));
+      return {
+        id: `local:${name}`,
+        name,
+        size: stat.size,
+        url: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`,
+        thumbnail: null
+      };
+    });
+    res.json({ data: files });
+  } catch (err) {
+    console.error('Upload list failed', err);
+    res.status(500).json({ data: [] });
+  }
+});
+
+// ---------- Library endpoint (combine) ----------
+app.get('/library', async (req, res) => {
+  try {
+    const local = fs.readdirSync(uploadDir).filter(n => n !== 'metadata.json').map(name => {
+      return {
+        type: 'songs',
+        id: `local:${name}`,
+        attributes: {
+          name,
+          artistName: 'Uploaded',
+          albumName: null,
+          durationInMillis: null,
+          artwork: { url: null, width: 600, height: 600 },
+          playUrl: `${req.protocol}://${req.get('host')}/uploads/${encodeURIComponent(name)}`,
+          drive: false
+        }
+      };
+    });
+
+    let driveFiles = [];
+    if (drive && process.env.DRIVE_FOLDER_ID) {
+      try {
+        const r = await drive.files.list({ q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`, fields: 'files(id,name,size,thumbnailLink)' });
+        driveFiles = (r.data.files || []).map(f => ({
+          type: 'songs',
+          id: f.id,
+          attributes: {
+            name: f.name,
+            artistName: 'Drive',
+            albumName: null,
+            durationInMillis: null,
+            artwork: { url: f.thumbnailLink || null, width: 600, height: 600 },
+            playUrl: `${req.protocol}://${req.get('host')}/drive/${encodeURIComponent(f.id)}`,
+            drive: true
+          }
+        }));
+      } catch (e) { console.warn('Drive list in library failed', e); }
+    }
+
+    res.json({ data: [...local, ...driveFiles] });
+  } catch (e) {
+    console.error('Library failed', e);
+    res.status(500).json({ data: [] });
   }
 });
 
@@ -220,7 +316,10 @@ app.get("/drive/:id", async (req, res) => {
       { responseType: "stream" }
     );
 
-    res.setHeader("Content-Type", "application/octet-stream");
+    // Attempt to set mime-type if available
+    const meta = await drive.files.get({ fileId, fields: 'mimeType' }).catch(()=>({}));
+    const mime = meta.data?.mimeType || 'application/octet-stream';
+    res.setHeader("Content-Type", mime);
     driveRes.data.pipe(res);
   } catch (err) {
     console.error("Drive read error:", err);
