@@ -161,26 +161,52 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const localPath = req.file.path;
-    const filename = req.file.originalname;
+    const filename = req.body.title?.trim() || req.file.originalname;
+    const artwork = req.body.artwork || req.body.artworkUrl || null;
 
     let driveFileId = null;
+    let driveUrl = null;
+
+    // If Drive configured, upload and try to make public; save metadata mapping
     if (drive && process.env.DRIVE_FOLDER_ID) {
-      const resDrive = await drive.files.create({
-        requestBody: {
-          name: filename,
-          parents: [process.env.DRIVE_FOLDER_ID]
-        },
-        media: {
-          mimeType: "application/octet-stream",
-          body: fs.createReadStream(localPath)
+      try {
+        const resDrive = await drive.files.create({
+          requestBody: {
+            name: filename,
+            parents: [process.env.DRIVE_FOLDER_ID]
+          },
+          media: {
+            mimeType: req.file.mimetype || "application/octet-stream",
+            body: fs.createReadStream(localPath)
+          },
+          fields: 'id,webViewLink,webContentLink'
+        });
+        driveFileId = resDrive.data.id;
+        // attempt to set public permission so direct download URL can be used
+        try {
+          await drive.permissions.create({ fileId: driveFileId, requestBody: { role: 'reader', type: 'anyone' } });
+          driveUrl = `https://drive.google.com/uc?export=download&id=${driveFileId}`;
+        } catch (e) {
+          console.warn('Failed to set public permission on Drive file', e);
+          // fallback to proxy URL
+          driveUrl = `${req.protocol}://${req.get('host')}/drive/${driveFileId}`;
         }
-      });
-      driveFileId = resDrive.data.id;
+
+        // store metadata
+        const meta = loadMeta();
+        meta[driveFileId] = meta[driveFileId] || {};
+        meta[driveFileId].name = filename;
+        if (artwork) meta[driveFileId].artworkUrl = artwork;
+        saveMeta(meta);
+      } catch (e) {
+        console.error('Drive upload failed:', e);
+      }
     }
 
     res.json({
       localUrl: `/uploads/${req.file.filename}`,
-      driveFileId
+      driveFileId,
+      driveUrl
     });
   } catch (err) {
     console.error("Upload error:", err);
@@ -310,20 +336,23 @@ app.get("/drive/:id", async (req, res) => {
     if (!drive) return res.status(500).json({ error: "Drive not configured" });
 
     const fileId = req.params.id;
+    const range = req.headers.range;
 
-    const driveRes = await drive.files.get(
-      { fileId, alt: "media" },
-      { responseType: "stream" }
-    );
+    const opts = { responseType: 'stream' };
+    if (range) opts.headers = { Range: range };
 
-    // Attempt to set mime-type if available
-    const meta = await drive.files.get({ fileId, fields: 'mimeType' }).catch(()=>({}));
+    const driveRes = await drive.files.get({ fileId, alt: 'media' }, opts);
+
+    // mime
+    const meta = await drive.files.get({ fileId, fields: 'mimeType' }).catch(() => ({}));
     const mime = meta.data?.mimeType || 'application/octet-stream';
-    res.setHeader("Content-Type", mime);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', mime);
+    if (range) res.status(206);
     driveRes.data.pipe(res);
   } catch (err) {
-    console.error("Drive read error:", err);
-    res.status(500).json({ error: "Failed to read Drive file" });
+    console.error('Drive read error:', err);
+    res.status(500).json({ error: 'Failed to read Drive file' });
   }
 });
 
