@@ -216,6 +216,26 @@ app.get("/drive/list", async (req, res) => {
   }
 });
 
+// ---------- Metadata store (simple JSON) ----------
+const METADATA_FILE = path.join(uploadDir, 'metadata.json');
+const loadMeta = () => {
+  try { return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')); } catch (e) { return {}; }
+};
+const saveMeta = (m) => { try { fs.writeFileSync(METADATA_FILE, JSON.stringify(m, null, 2)); } catch (e) { console.error('meta save failed', e); } };
+
+// Edit metadata for a file (local or drive id)
+app.post('/drive/edit', express.json(), (req, res) => {
+  const { id, albumName, artistName, artworkUrl } = req.body;
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+  const meta = loadMeta();
+  meta[id] = meta[id] || {};
+  if (albumName !== undefined) meta[id].albumName = albumName;
+  if (artistName !== undefined) meta[id].artistName = artistName;
+  if (artworkUrl !== undefined) meta[id].artworkUrl = artworkUrl;
+  saveMeta(meta);
+  res.json({ id, meta: meta[id] });
+});
+
 // ---------- List local uploads ----------
 app.get('/upload/list', (req, res) => {
   try {
