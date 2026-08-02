@@ -8,13 +8,25 @@ import mime from "mime-types";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { google } from "googleapis";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand,
+  HeadObjectCommand
+} from "@aws-sdk/client-s3";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// Railway sits behind a proxy — tell Express to trust the X-Forwarded-For
+// header so express-rate-limit can correctly identify clients instead of
+// throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every request.
+app.set("trust proxy", 1);
 
 // basic security + CORS
 app.use(helmet());
@@ -35,9 +47,8 @@ app.use(limiter);
 app.use(express.static(path.join(__dirname, "public")));
 
 // uploads folder — used ONLY as a temporary staging area before files
-// are pushed to Google Drive (the primary/permanent store). Nothing in
-// here is served directly or considered durable, since Railway's disk
-// is wiped on every redeploy.
+// are pushed to R2 (the primary/permanent store). Nothing here is
+// served directly or considered durable.
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -67,37 +78,41 @@ const upload = multer({
   }
 });
 
-// ---------- Google Drive setup ----------
+// ---------- Cloudflare R2 setup ----------
+// R2 is S3-compatible, so the standard AWS SDK v3 S3 client works
+// against it directly — just point endpoint at the R2 account URL.
 
-let drive = null;
+let s3 = null;
+const R2_BUCKET = process.env.R2_BUCKET_NAME;
 
-function initDrive() {
-  const b64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64;
-  if (!b64) {
-    console.warn("GOOGLE_SERVICE_ACCOUNT_JSON_B64 not set — Drive storage disabled");
+function initR2() {
+  const accountId = process.env.R2_ACCOUNT_ID;
+  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+
+  if (!accountId || !accessKeyId || !secretAccessKey || !R2_BUCKET) {
+    console.warn("R2 env vars incomplete — storage disabled. Need R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME");
     return;
   }
 
-  const json = Buffer.from(b64, "base64").toString("utf8");
-  const creds = JSON.parse(json);
-
-  const auth = new google.auth.GoogleAuth({
-    credentials: creds,
-    scopes: ["https://www.googleapis.com/auth/drive"]
+  s3 = new S3Client({
+    region: "auto",
+    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId, secretAccessKey }
   });
-
-  drive = google.drive({ version: "v3", auth });
 }
 
-initDrive();
+initR2();
 
 // ---------- Metadata store (simple JSON, lives in uploadDir) ----------
-// Note: this file is also on ephemeral disk. It caches display metadata
-// (custom titles, artist/album/artwork overrides) for Drive files, but
-// Drive itself remains the source of truth for which files exist. If
-// this file is lost on redeploy, files still show up via drive.files.list,
-// just with default names instead of your custom metadata.
+// Caches display metadata (custom titles, artist/album/artwork overrides,
+// original filename, mimeType, size) keyed by the R2 object key. This file
+// is on ephemeral disk, so it's also mirrored into R2 itself as a backup
+// object (metadata.json) and reloaded from there on startup if the local
+// copy is missing — this way a Railway redeploy doesn't wipe your titles.
 const METADATA_FILE = path.join(uploadDir, "metadata.json");
+const METADATA_R2_KEY = "_metadata.json";
+
 const loadMeta = () => {
   try {
     return JSON.parse(fs.readFileSync(METADATA_FILE, "utf8"));
@@ -111,7 +126,31 @@ const saveMeta = (m) => {
   } catch (e) {
     console.error("meta save failed", e);
   }
+  // best-effort mirror to R2; failures here shouldn't break the request
+  if (s3) {
+    s3.send(new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: METADATA_R2_KEY,
+      Body: JSON.stringify(m, null, 2),
+      ContentType: "application/json"
+    })).catch(e => console.warn("metadata R2 mirror failed:", e.message));
+  }
 };
+
+async function restoreMetaFromR2() {
+  if (!s3) return;
+  try {
+    const cmd = new GetObjectCommand({ Bucket: R2_BUCKET, Key: METADATA_R2_KEY });
+    const res = await s3.send(cmd);
+    const body = await res.Body.transformToString();
+    fs.writeFileSync(METADATA_FILE, body);
+    console.log("Restored metadata.json from R2");
+  } catch (e) {
+    // no remote metadata yet, or first run — not an error
+    console.log("No existing metadata.json in R2 (fine on first run)");
+  }
+}
+await restoreMetaFromR2();
 
 // ---------- Search (Deezer) ----------
 
@@ -217,7 +256,7 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-// ---------- Upload (Drive is primary storage) ----------
+// ---------- Upload (R2 is primary storage) ----------
 
 app.post(
   "/upload",
@@ -241,58 +280,49 @@ app.post(
       const albumName = req.body.albumName?.trim() || null;
       const artwork = req.body.artwork || req.body.artworkUrl || null;
 
-      if (!drive || !process.env.DRIVE_FOLDER_ID) {
+      if (!s3 || !R2_BUCKET) {
         fs.unlink(localPath, () => {});
-        return res.status(500).json({ error: "Drive storage is not configured on the server" });
+        return res.status(500).json({ error: "R2 storage is not configured on the server" });
       }
 
-      let driveFileId, driveUrl;
+      const ext = path.extname(req.file.originalname) || "";
+      const objectKey = `tracks/${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+      const contentType = req.file.mimetype || mime.lookup(req.file.originalname) || "application/octet-stream";
 
       try {
-        const resDrive = await drive.files.create({
-          requestBody: {
-            name: filename,
-            parents: [process.env.DRIVE_FOLDER_ID]
-          },
-          media: {
-            mimeType: req.file.mimetype || mime.lookup(req.file.originalname) || "application/octet-stream",
-            body: fs.createReadStream(localPath)
-          },
-          fields: "id,webViewLink,webContentLink"
-        });
-        driveFileId = resDrive.data.id;
+        const fileStream = fs.createReadStream(localPath);
+        const stat = fs.statSync(localPath);
 
-        try {
-          await drive.permissions.create({
-            fileId: driveFileId,
-            requestBody: { role: "reader", type: "anyone" }
-          });
-        } catch (e) {
-          console.warn("Failed to set public permission on Drive file:", e.message);
-        }
-
-        // Use our own proxy route (not the raw Drive URL) so Range
-        // requests work properly for audio/video seeking.
-        driveUrl = `${req.protocol}://${req.get("host")}/drive/${driveFileId}`;
+        await s3.send(new PutObjectCommand({
+          Bucket: R2_BUCKET,
+          Key: objectKey,
+          Body: fileStream,
+          ContentType: contentType,
+          ContentLength: stat.size
+        }));
 
         const meta = loadMeta();
-        meta[driveFileId] = meta[driveFileId] || {};
-        meta[driveFileId].name = filename;
-        meta[driveFileId].mimeType = req.file.mimetype;
-        if (artistName) meta[driveFileId].artistName = artistName;
-        if (albumName) meta[driveFileId].albumName = albumName;
-        if (artwork) meta[driveFileId].artworkUrl = artwork;
+        meta[objectKey] = {
+          name: filename,
+          mimeType: contentType,
+          size: stat.size
+        };
+        if (artistName) meta[objectKey].artistName = artistName;
+        if (albumName) meta[objectKey].albumName = albumName;
+        if (artwork) meta[objectKey].artworkUrl = artwork;
         saveMeta(meta);
+
+        const driveUrl = `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(objectKey)}`;
+
+        res.json({ driveFileId: objectKey, driveUrl });
       } catch (e) {
-        console.error("Drive upload failed:", e.message);
-        return res.status(502).json({ error: "Upload to Drive failed" });
+        console.error("R2 upload failed:", e.message);
+        return res.status(502).json({ error: "Upload to R2 failed" });
       } finally {
         fs.unlink(localPath, (err) => {
           if (err) console.warn("Failed to remove temp file:", err.message);
         });
       }
-
-      res.json({ driveFileId, driveUrl });
     } catch (err) {
       console.error("Upload error:", err);
       if (localPath) fs.unlink(localPath, () => {});
@@ -301,7 +331,7 @@ app.post(
   }
 );
 
-// ---------- Edit metadata for a Drive file ----------
+// ---------- Edit metadata for a track ----------
 
 app.post("/drive/edit", (req, res) => {
   const { id, albumName, artistName, artworkUrl, name } = req.body;
@@ -316,60 +346,61 @@ app.post("/drive/edit", (req, res) => {
   res.json({ id, meta: meta[id] });
 });
 
-// ---------- Delete a Drive file + its metadata ----------
+// ---------- Delete a track + its metadata ----------
 
 app.delete("/drive/:id", async (req, res) => {
   try {
-    if (!drive) return res.status(500).json({ error: "Drive not configured" });
-    const fileId = req.params.id;
+    if (!s3) return res.status(500).json({ error: "R2 not configured" });
+    const objectKey = decodeURIComponent(req.params.id);
 
-    await drive.files.delete({ fileId });
+    await s3.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: objectKey }));
 
     const meta = loadMeta();
-    if (meta[fileId]) {
-      delete meta[fileId];
+    if (meta[objectKey]) {
+      delete meta[objectKey];
       saveMeta(meta);
     }
 
-    res.json({ deleted: true, id: fileId });
+    res.json({ deleted: true, id: objectKey });
   } catch (err) {
-    console.error("Drive delete error:", err.message);
-    res.status(500).json({ error: "Failed to delete Drive file" });
+    console.error("R2 delete error:", err.message);
+    res.status(500).json({ error: "Failed to delete file" });
   }
 });
 
-// ---------- Library endpoint (Drive is the source of truth) ----------
+// ---------- Library endpoint (R2 is the source of truth) ----------
 
 app.get("/library", async (req, res) => {
   try {
-    if (!drive || !process.env.DRIVE_FOLDER_ID) {
-      return res.status(500).json({ error: "Drive not configured", data: [] });
+    if (!s3 || !R2_BUCKET) {
+      return res.status(500).json({ error: "R2 not configured", data: [] });
     }
 
-    const r = await drive.files.list({
-      q: `'${process.env.DRIVE_FOLDER_ID}' in parents and trashed = false`,
-      fields: "files(id, name, size, mimeType, thumbnailLink)"
-    });
+    const list = await s3.send(new ListObjectsV2Command({
+      Bucket: R2_BUCKET,
+      Prefix: "tracks/"
+    }));
 
     const meta = loadMeta();
+    const objects = list.Contents || [];
 
-    const files = (r.data.files || []).map(f => {
-      const m = meta[f.id] || {};
+    const files = objects.map(obj => {
+      const m = meta[obj.Key] || {};
       return {
         type: "songs",
-        id: f.id,
+        id: obj.Key,
         attributes: {
-          name: m.name || f.name,
+          name: m.name || obj.Key.split("/").pop(),
           artistName: m.artistName || "Unknown",
           albumName: m.albumName || null,
           durationInMillis: null,
           artwork: {
-            url: m.artworkUrl || f.thumbnailLink || null,
+            url: m.artworkUrl || null,
             width: 600,
             height: 600
           },
-          playUrl: `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(f.id)}`,
-          mimeType: f.mimeType,
+          playUrl: `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(obj.Key)}`,
+          mimeType: m.mimeType || mime.lookup(obj.Key) || "application/octet-stream",
           drive: true
         }
       };
@@ -382,43 +413,43 @@ app.get("/library", async (req, res) => {
   }
 });
 
-// ---------- Stream a Drive file (supports Range requests) ----------
+// ---------- Stream a track (supports Range requests) ----------
 
 app.get("/drive/:id", async (req, res) => {
   try {
-    if (!drive) return res.status(500).json({ error: "Drive not configured" });
+    if (!s3) return res.status(500).json({ error: "R2 not configured" });
 
-    const fileId = req.params.id;
+    const objectKey = decodeURIComponent(req.params.id);
     const range = req.headers.range;
 
-    const metaRes = await drive.files.get({ fileId, fields: "mimeType, size" });
-    const mimeType = metaRes.data.mimeType || "application/octet-stream";
-    const size = parseInt(metaRes.data.size, 10) || null;
+    const head = await s3.send(new HeadObjectCommand({ Bucket: R2_BUCKET, Key: objectKey }));
+    const mimeType = head.ContentType || mime.lookup(objectKey) || "application/octet-stream";
+    const size = head.ContentLength;
 
-    const opts = { responseType: "stream" };
-    if (range && size) opts.headers = { Range: range };
+    const getCmd = new GetObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: objectKey,
+      ...(range ? { Range: range } : {})
+    });
 
-    const driveRes = await drive.files.get({ fileId, alt: "media" }, opts);
+    const obj = await s3.send(getCmd);
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Content-Type", mimeType);
     res.setHeader("Accept-Ranges", "bytes");
 
-    const upstreamRange = driveRes.headers["content-range"];
-    const upstreamLength = driveRes.headers["content-length"];
-
-    if (range && upstreamRange) {
+    if (range && obj.ContentRange) {
       res.status(206);
-      res.setHeader("Content-Range", upstreamRange);
-      if (upstreamLength) res.setHeader("Content-Length", upstreamLength);
+      res.setHeader("Content-Range", obj.ContentRange);
+      if (obj.ContentLength) res.setHeader("Content-Length", obj.ContentLength);
     } else if (size) {
       res.setHeader("Content-Length", size);
     }
 
-    driveRes.data.pipe(res);
+    obj.Body.pipe(res);
   } catch (err) {
-    console.error("Drive read error:", err.message);
-    res.status(500).json({ error: "Failed to read Drive file" });
+    console.error("R2 read error:", err.message);
+    res.status(500).json({ error: "Failed to read file" });
   }
 });
 
