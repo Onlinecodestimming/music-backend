@@ -1,711 +1,520 @@
 "use strict";
 
-const crypto = require("crypto");
-const path = require("path");
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const compression = require("compression");
-const morgan = require("morgan");
 const multer = require("multer");
-const rateLimit = require("express-rate-limit");
-const { Pool } = require("pg");
+const crypto = require("crypto");
+const path = require("path");
+const mime = require("mime-types");
+const { v4: uuid } = require("uuid");
+
 const {
-  S3Client,
-  PutObjectCommand,
-  DeleteObjectCommand
+    S3Client,
+    PutObjectCommand,
+    GetObjectCommand,
+    DeleteObjectCommand
 } = require("@aws-sdk/client-s3");
 
-const PORT = Number(process.env.PORT || 3000);
-const MAX_FILE_SIZE = 60 * 1024 * 1024;
+const { Upload } = require("@aws-sdk/lib-storage");
 
-const REQUIRED_ENV = [
-  "DATABASE_URL",
-  "R2_ENDPOINT",
-  "R2_ACCESS_KEY_ID",
-  "R2_SECRET_ACCESS_KEY",
-  "R2_BUCKET",
-  "R2_PUBLIC_URL"
-];
-
-for (const name of REQUIRED_ENV) {
-  if (!process.env[name]) {
-    console.error(`Missing required environment variable: ${name}`);
-    process.exit(1);
-  }
-}
-
-const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL.replace(/\/+$/, "");
-
-const allowedOrigins = (process.env.FRONTEND_ORIGINS || "")
-  .split(",")
-  .map(value => value.trim().replace(/\/+$/, ""))
-  .filter(Boolean);
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.DB_SSL === "false"
-      ? false
-      : { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 10_000
-});
-
-const r2 = new S3Client({
-  region: "auto",
-  endpoint: process.env.R2_ENDPOINT,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
-  }
-});
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-
-  limits: {
-    fileSize: MAX_FILE_SIZE,
-    files: 1
-  },
-
-  fileFilter: (_req, file, callback) => {
-    const allowedMime =
-      file.mimetype.startsWith("audio/") ||
-      file.mimetype.startsWith("video/");
-
-    const allowedExtension = [
-      ".mp3",
-      ".wav",
-      ".flac",
-      ".ogg",
-      ".oga",
-      ".m4a",
-      ".aac",
-      ".mp4",
-      ".webm"
-    ].includes(path.extname(file.originalname).toLowerCase());
-
-    if (!allowedMime || !allowedExtension) {
-      return callback(
-        new HttpError(
-          415,
-          "Only supported audio/video files are allowed."
-        )
-      );
-    }
-
-    callback(null, true);
-  }
-});
-
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-
-function asyncRoute(handler) {
-  return (req, res, next) =>
-    Promise.resolve(handler(req, res, next)).catch(next);
-}
-
-function normalizeText(value, fallback = "") {
-  const text = String(value ?? "").trim();
-  return text.slice(0, 300) || fallback;
-}
-
-function cleanExtension(filename, mimeType) {
-  const ext = path
-    .extname(filename)
-    .toLowerCase()
-    .replace(/[^.a-z0-9]/g, "");
-
-  if (ext && ext.length <= 8) {
-    return ext;
-  }
-
-  const byMime = {
-    "audio/mpeg": ".mp3",
-    "audio/mp4": ".m4a",
-    "audio/flac": ".flac",
-    "audio/wav": ".wav",
-    "audio/ogg": ".ogg",
-    "video/mp4": ".mp4",
-    "video/webm": ".webm"
-  };
-
-  return byMime[mimeType] || ".bin";
-}
-
-function publicObjectUrl(key) {
-  const encodedKey = key
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/");
-
-  return `${R2_PUBLIC_URL}/${encodedKey}`;
-}
-
-function mapTrack(row) {
-  return {
-    id: row.id,
-    title: row.title,
-    artist: row.artist,
-    album: row.album,
-    artwork: row.artwork_url || "",
-    url: row.audio_url,
-    filename: row.original_filename,
-    size: Number(row.file_size || 0),
-    duration: Number(row.duration || 0),
-    mimeType: row.mime_type,
-    uploadedAt: new Date(row.uploaded_at).toISOString()
-  };
-}
-
-async function initializeDatabase() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS tracks (
-      id UUID PRIMARY KEY,
-      title VARCHAR(300) NOT NULL,
-      artist VARCHAR(300) NOT NULL DEFAULT '',
-      album VARCHAR(300) NOT NULL DEFAULT '',
-      artwork_url TEXT NOT NULL DEFAULT '',
-      audio_url TEXT NOT NULL,
-      object_key TEXT NOT NULL UNIQUE,
-      artwork_key TEXT,
-      original_filename TEXT NOT NULL,
-      mime_type VARCHAR(150) NOT NULL,
-      file_size BIGINT NOT NULL,
-      duration DOUBLE PRECISION NOT NULL DEFAULT 0,
-      uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS tracks_uploaded_at_idx
-      ON tracks (uploaded_at DESC);
-
-    CREATE INDEX IF NOT EXISTS tracks_search_idx
-      ON tracks (LOWER(title), LOWER(artist), LOWER(album));
-  `);
-}
-
-async function uploadToR2({
-  key,
-  body,
-  contentType,
-  cacheControl = "public, max-age=31536000, immutable"
-}) {
-  await r2.send(
-    new PutObjectCommand({
-      Bucket: process.env.R2_BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-      CacheControl: cacheControl,
-      ContentDisposition: "inline"
-    })
-  );
-
-  return publicObjectUrl(key);
-}
-
-async function deleteFromR2(key) {
-  if (!key) {
-    return;
-  }
-
-  await r2.send(
-    new DeleteObjectCommand({
-      Bucket: process.env.R2_BUCKET,
-      Key: key
-    })
-  );
-}
-
-async function parseMetadata(file) {
-  try {
-    const { parseBuffer } = await import("music-metadata");
-
-    return await parseBuffer(
-      file.buffer,
-      {
-        mimeType: file.mimetype,
-        size: file.size,
-        path: file.originalname
-      },
-      {
-        duration: true,
-        skipCovers: false
-      }
-    );
-  } catch (error) {
-    console.warn("Metadata extraction skipped:", error.message);
-
-    return {
-      common: {},
-      format: {}
-    };
-  }
-}
-
-function requireAdmin(req, _res, next) {
-  const configured = process.env.ADMIN_KEY;
-
-  if (!configured) {
-    return next();
-  }
-
-  const supplied = req.get("x-admin-key") || "";
-
-  const configuredBuffer = Buffer.from(configured);
-  const suppliedBuffer = Buffer.from(supplied);
-
-  if (
-    configuredBuffer.length !== suppliedBuffer.length ||
-    !crypto.timingSafeEqual(configuredBuffer, suppliedBuffer)
-  ) {
-    return next(
-      new HttpError(
-        401,
-        "An administrator key is required."
-      )
-    );
-  }
-
-  next();
-}
+const mm = require("music-metadata");
 
 const app = express();
 
-app.set("trust proxy", 1);
+const PORT = process.env.PORT || 3000;
 
-app.use(
-  helmet({
-    crossOriginResourcePolicy: {
-      policy: "cross-origin"
+const ADMIN_KEY = process.env.ADMIN_KEY;
+
+const R2_BUCKET = process.env.R2_BUCKET;
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL.replace(/\/$/, "");
+
+const s3 = new S3Client({
+    region: "auto",
+    endpoint: process.env.R2_ENDPOINT,
+    credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
     }
-  })
-);
+});
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 60 * 1024 * 1024
+    }
+});
+
+app.use(helmet({
+    crossOriginResourcePolicy: {
+        policy: "cross-origin"
+    }
+}));
 
 app.use(compression());
 
-app.use(
-  morgan(
-    process.env.NODE_ENV === "production"
-      ? "combined"
-      : "dev"
-  )
-);
+app.use(cors({
+    origin: "*"
+}));
 
-app.use(
-  express.json({
-    limit: "1mb"
-  })
-);
+app.use(express.json());
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      const normalizedOrigin = origin
-        ? origin.replace(/\/+$/, "")
-        : "";
+function auth(req, res, next){
 
-      if (
-        !origin ||
-        allowedOrigins.length === 0 ||
-        allowedOrigins.includes(normalizedOrigin)
-      ) {
-        return callback(null, true);
-      }
+    if(!ADMIN_KEY)
+        return next();
 
-      callback(
-        new HttpError(
-          403,
-          "This frontend origin is not allowed."
-        )
-      );
-    },
+    if(req.headers["x-admin-key"] !== ADMIN_KEY){
 
-    methods: [
-      "GET",
-      "POST",
-      "PATCH",
-      "DELETE",
-      "OPTIONS"
-    ],
+        return res.status(401).json({
+            error:"Unauthorized"
+        });
 
-    allowedHeaders: [
-      "Content-Type",
-      "X-Admin-Key"
-    ]
-  })
-);
+    }
 
-const writeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 100,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
+    next();
 
-  message: {
-    error:
-      "Too many write requests. Please try again later."
-  }
+}
+
+async function streamToBuffer(stream){
+
+    const chunks=[];
+
+    for await(const chunk of stream)
+        chunks.push(chunk);
+
+    return Buffer.concat(chunks);
+
+}
+
+async function getLibrary(){
+
+    try{
+
+        const obj=await s3.send(new GetObjectCommand({
+            Bucket:R2_BUCKET,
+            Key:"library.json"
+        }));
+
+        const txt=(await streamToBuffer(obj.Body)).toString();
+
+        return JSON.parse(txt);
+
+    }
+
+    catch{
+
+        return{
+            tracks:[]
+        };
+
+    }
+
+}
+
+async function saveLibrary(library){
+
+    await s3.send(new PutObjectCommand({
+
+        Bucket:R2_BUCKET,
+
+        Key:"library.json",
+
+        Body:JSON.stringify(library,null,2),
+
+        ContentType:"application/json"
+
+    }));
+
+}
+
+function publicUrl(key){
+
+    return `${R2_PUBLIC_URL}/${key}`;
+
+}
+
+async function uploadBuffer(buffer,key,type){
+
+    await new Upload({
+
+        client:s3,
+
+        params:{
+
+            Bucket:R2_BUCKET,
+
+            Key:key,
+
+            Body:buffer,
+
+            ContentType:type,
+
+            CacheControl:"public,max-age=31536000"
+
+        }
+
+    }).done();
+
+    return publicUrl(key);
+
+}
+
+async function deleteObject(key){
+
+    if(!key)
+        return;
+
+    await s3.send(new DeleteObjectCommand({
+
+        Bucket:R2_BUCKET,
+
+        Key:key
+
+    }));
+
+}
+
+async function extractMetadata(file){
+
+    try{
+
+        return await mm.parseBuffer(
+            file.buffer,
+            {
+                mimeType:file.mimetype
+            },
+            {
+                duration:true
+            }
+        );
+
+    }
+
+    catch{
+
+        return{
+
+            common:{},
+
+            format:{}
+
+        };
+
+    }
+
+}
+app.get("/health",(req,res)=>{
+
+    res.json({
+        ok:true,
+        storage:"Cloudflare R2"
+    });
+
 });
 
-app.get(
-  "/health",
-  asyncRoute(async (_req, res) => {
-    await pool.query("SELECT 1");
+app.get("/api/library",async(req,res)=>{
 
-    res.json({
-      ok: true,
-      storage: "r2",
-      database: "postgresql"
+    const library=await getLibrary();
+
+    const q=(req.query.q||"").toLowerCase().trim();
+
+    if(!q)
+        return res.json(library);
+
+    const tracks=library.tracks.filter(track=>{
+
+        return(
+            track.title.toLowerCase().includes(q)||
+            track.artist.toLowerCase().includes(q)||
+            track.album.toLowerCase().includes(q)
+        );
+
     });
-  })
-);
 
-app.get(
-  "/api/library",
-  asyncRoute(async (req, res) => {
-    const q = normalizeText(req.query.q);
+    res.json({tracks});
 
-    const values = [];
-    let where = "";
-
-    if (q) {
-      values.push(`%${q}%`);
-
-      where = `
-        WHERE title ILIKE $1
-           OR artist ILIKE $1
-           OR album ILIKE $1
-      `;
-    }
-
-    const result = await pool.query(
-      `
-        SELECT *
-        FROM tracks
-        ${where}
-        ORDER BY uploaded_at ASC
-        LIMIT 5000
-      `,
-      values
-    );
-
-    res.json({
-      tracks: result.rows.map(mapTrack)
-    });
-  })
-);
+});
 
 app.post(
-  "/upload",
-  writeLimiter,
-  requireAdmin,
-  upload.single("file"),
+    "/upload",
+    auth,
+    upload.single("file"),
+    async(req,res)=>{
 
-  asyncRoute(async (req, res) => {
-    if (!req.file) {
-      throw new HttpError(
-        400,
-        "No file was uploaded."
-      );
-    }
+        if(!req.file){
 
-    const id = crypto.randomUUID();
+            return res.status(400).json({
+                error:"No file uploaded."
+            });
 
-    const metadata = await parseMetadata(req.file);
+        }
 
-    const extension = cleanExtension(
-      req.file.originalname,
-      req.file.mimetype
-    );
+        const metadata=await extractMetadata(req.file);
 
-    const objectKey = `music/${id}${extension}`;
+        const id=uuid();
 
-    let artworkKey = null;
-    let artworkUrl = normalizeText(req.body.artwork);
+        const ext=
+            path.extname(req.file.originalname)||
+            "."+mime.extension(req.file.mimetype);
 
-    const common = metadata.common || {};
+        const audioKey=`music/${id}${ext}`;
 
-    const title = normalizeText(
-      req.body.title,
-      common.title ||
-        path.parse(req.file.originalname).name
-    );
+        const audioUrl=await uploadBuffer(
 
-    const artist = normalizeText(
-      req.body.artist,
-      common.artist ||
-        common.albumartist ||
-        "Unknown Artist"
-    );
+            req.file.buffer,
 
-    const album = normalizeText(
-      req.body.album,
-      common.album || "Singles"
-    );
+            audioKey,
 
-    const duration = Number.isFinite(
-      metadata.format?.duration
-    )
-      ? metadata.format.duration
-      : 0;
+            req.file.mimetype
 
-    try {
-      const audioUrl = await uploadToR2({
-        key: objectKey,
-        body: req.file.buffer,
-        contentType: req.file.mimetype
-      });
+        );
 
-      const picture = Array.isArray(common.picture)
-        ? common.picture[0]
-        : null;
+        let artwork="";
+        let artworkKey="";
 
-      if (
-        !artworkUrl &&
-        picture?.data?.length
-      ) {
-        const imageExtension =
-          picture.format === "image/png"
-            ? ".png"
-            : picture.format === "image/webp"
-              ? ".webp"
-              : ".jpg";
+        const picture=metadata.common.picture?.[0];
 
-        artworkKey =
-          `artwork/${id}${imageExtension}`;
+        if(picture){
 
-        artworkUrl = await uploadToR2({
-          key: artworkKey,
-          body: Buffer.from(picture.data),
-          contentType:
-            picture.format || "image/jpeg"
-        });
-      }
+            const imgExt=
 
-      const inserted = await pool.query(
-        `
-          INSERT INTO tracks (
+                picture.format==="image/png"
+                ?".png"
+
+                :picture.format==="image/webp"
+                ?".webp"
+
+                :".jpg";
+
+            artworkKey=`artwork/${id}${imgExt}`;
+
+            artwork=await uploadBuffer(
+
+                picture.data,
+
+                artworkKey,
+
+                picture.format
+
+            );
+
+        }
+
+        else if(req.body.artwork){
+
+            artwork=req.body.artwork.trim();
+
+        }
+
+        const track={
+
             id,
-            title,
-            artist,
-            album,
-            artwork_url,
-            audio_url,
-            object_key,
-            artwork_key,
-            original_filename,
-            mime_type,
-            file_size,
-            duration
-          )
-          VALUES (
-            $1, $2, $3, $4, $5, $6,
-            $7, $8, $9, $10, $11, $12
-          )
-          RETURNING *
-        `,
-        [
-          id,
-          title,
-          artist,
-          album,
-          artworkUrl,
-          audioUrl,
-          objectKey,
-          artworkKey,
-          req.file.originalname,
-          req.file.mimetype,
-          req.file.size,
-          duration
-        ]
-      );
 
-      res.status(201).json({
-        ok: true,
-        track: mapTrack(inserted.rows[0])
-      });
-    } catch (error) {
-      await Promise.allSettled([
-        deleteFromR2(objectKey),
-        deleteFromR2(artworkKey)
-      ]);
+            title:
+                req.body.title?.trim()||
+                metadata.common.title||
+                path.parse(req.file.originalname).name,
 
-      throw error;
+            artist:
+                req.body.artist?.trim()||
+                metadata.common.artist||
+                metadata.common.albumartist||
+                "Unknown Artist",
+
+            album:
+                req.body.album?.trim()||
+                metadata.common.album||
+                "Singles",
+
+            artwork,
+
+            artworkKey,
+
+            url:audioUrl,
+
+            objectKey:audioKey,
+
+            filename:req.file.originalname,
+
+            mime:req.file.mimetype,
+
+            size:req.file.size,
+
+            duration:
+                metadata.format.duration||0,
+
+            uploadedAt:
+                new Date().toISOString()
+
+        };
+
+        const library=await getLibrary();
+
+        library.tracks.push(track);
+
+        await saveLibrary(library);
+
+        res.status(201).json({
+
+            ok:true,
+
+            track
+
+        });
+
     }
-  })
+
 );
 
 app.patch(
-  "/api/tracks/:id",
-  writeLimiter,
-  requireAdmin,
+    "/api/tracks/:id",
+    auth,
+    async(req,res)=>{
 
-  asyncRoute(async (req, res) => {
-    const current = await pool.query(
-      `
-        SELECT *
-        FROM tracks
-        WHERE id = $1
-      `,
-      [req.params.id]
-    );
+        const library=await getLibrary();
 
-    if (current.rowCount === 0) {
-      throw new HttpError(
-        404,
-        "Track not found."
-      );
+        const track=library.tracks.find(
+
+            t=>t.id===req.params.id
+
+        );
+
+        if(!track){
+
+            return res.status(404).json({
+
+                error:"Track not found."
+
+            });
+
+        }
+
+        if(req.body.title!==undefined)
+            track.title=req.body.title.trim();
+
+        if(req.body.artist!==undefined)
+            track.artist=req.body.artist.trim();
+
+        if(req.body.album!==undefined)
+            track.album=req.body.album.trim();
+
+        if(req.body.artwork!==undefined)
+            track.artwork=req.body.artwork.trim();
+
+        await saveLibrary(library);
+
+        res.json({
+
+            ok:true,
+
+            track
+
+        });
+
     }
 
-    const old = current.rows[0];
-
-    const title = normalizeText(
-      req.body.title,
-      old.title
-    );
-
-    const artist = normalizeText(
-      req.body.artist,
-      old.artist
-    );
-
-    const album = normalizeText(
-      req.body.album,
-      old.album
-    );
-
-    const artworkUrl =
-      req.body.artwork === undefined
-        ? old.artwork_url
-        : normalizeText(req.body.artwork);
-
-    const updated = await pool.query(
-      `
-        UPDATE tracks
-        SET
-          title = $1,
-          artist = $2,
-          album = $3,
-          artwork_url = $4,
-          updated_at = NOW()
-        WHERE id = $5
-        RETURNING *
-      `,
-      [
-        title,
-        artist,
-        album,
-        artworkUrl,
-        req.params.id
-      ]
-    );
-
-    res.json({
-      ok: true,
-      track: mapTrack(updated.rows[0])
-    });
-  })
 );
-
 app.delete(
-  "/api/tracks/:id",
-  writeLimiter,
-  requireAdmin,
+    "/api/tracks/:id",
+    auth,
+    async(req,res)=>{
 
-  asyncRoute(async (req, res) => {
-    const result = await pool.query(
-      `
-        DELETE FROM tracks
-        WHERE id = $1
-        RETURNING *
-      `,
-      [req.params.id]
-    );
+        const library=await getLibrary();
 
-    if (result.rowCount === 0) {
-      throw new HttpError(
-        404,
-        "Track not found."
-      );
+        const index=library.tracks.findIndex(
+            t=>t.id===req.params.id
+        );
+
+        if(index===-1){
+
+            return res.status(404).json({
+                error:"Track not found."
+            });
+
+        }
+
+        const track=library.tracks[index];
+
+        try{
+
+            await deleteObject(track.objectKey);
+
+            if(track.artworkKey)
+                await deleteObject(track.artworkKey);
+
+        }
+        catch(err){
+
+            console.error("R2 delete failed:",err);
+
+        }
+
+        library.tracks.splice(index,1);
+
+        await saveLibrary(library);
+
+        res.json({
+            ok:true
+        });
+
     }
-
-    const track = result.rows[0];
-
-    const deletion = await Promise.allSettled([
-      deleteFromR2(track.object_key),
-      deleteFromR2(track.artwork_key)
-    ]);
-
-    const storageWarning = deletion.some(
-      item => item.status === "rejected"
-    );
-
-    res.json({
-      ok: true,
-      storageWarning
-    });
-  })
 );
 
-app.use((_req, _res, next) => {
-  next(
-    new HttpError(
-      404,
-      "Route not found."
-    )
-  );
+app.use((req,res)=>{
+
+    res.status(404).json({
+        error:"Route not found."
+    });
+
 });
 
-app.use((error, _req, res, _next) => {
-  if (error instanceof multer.MulterError) {
-    const message =
-      error.code === "LIMIT_FILE_SIZE"
-        ? "The file exceeds the 60 MB limit."
-        : error.message;
+app.use((err,req,res,next)=>{
 
-    return res.status(400).json({
-      error: message
+    console.error(err);
+
+    if(err instanceof multer.MulterError){
+
+        return res.status(400).json({
+
+            error:
+                err.code==="LIMIT_FILE_SIZE"
+                    ?"Maximum file size is 60MB."
+                    :err.message
+
+        });
+
+    }
+
+    res.status(500).json({
+
+        error:
+            err.message||
+            "Internal Server Error"
+
     });
-  }
 
-  const status = Number(
-    error.status || 500
-  );
-
-  if (status >= 500) {
-    console.error(error);
-  }
-
-  res.status(status).json({
-    error:
-      status >= 500
-        ? "The server encountered an error."
-        : error.message
-  });
 });
 
-initializeDatabase()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(
-        `Musicfy API listening on port ${PORT}`
-      );
-    });
-  })
-  .catch(error => {
-    console.error(
-      "Database initialization failed:",
-      error
-    );
+app.listen(PORT,()=>{
 
-    process.exit(1);
-  });
+    console.log("");
+
+    console.log("====================================");
+
+    console.log(" Musicfy Backend Started");
+
+    console.log("====================================");
+
+    console.log(`Port: ${PORT}`);
+
+    console.log(`Bucket: ${R2_BUCKET}`);
+
+    console.log(`Public URL: ${R2_PUBLIC_URL}`);
+
+    console.log("");
+
+});
