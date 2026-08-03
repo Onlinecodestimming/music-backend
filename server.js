@@ -334,7 +334,9 @@ app.post(
   "/upload",
   requireAdmin,
   (req, res, next) => {
-    upload.single("file")(req, res, (err) => {
+    // Up to 25 files per request — a generous batch size that still
+    // keeps memory/temp-disk usage on Railway reasonable.
+    upload.array("files", 25)(req, res, (err) => {
       if (err) {
         console.error("Multer error:", err.message);
         return res.status(400).json({ error: err.message });
@@ -343,73 +345,91 @@ app.post(
     });
   },
   async (req, res) => {
-    let localPath;
-    try {
-      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const files = req.files || [];
+    const cleanup = () => files.forEach(f => fs.unlink(f.path, () => {}));
 
-      localPath = req.file.path;
-      const filename = req.body.title?.trim() || req.file.originalname;
+    try {
+      if (files.length === 0) return res.status(400).json({ error: "No files uploaded" });
+
       const artistName = req.body.artistName?.trim() || null;
       const albumName = req.body.albumName?.trim() || null;
       const artwork = req.body.artwork || req.body.artworkUrl || null;
 
+      // Artwork is now a hard requirement — every album needs a cover
+      // so it never shows up blank in Browse/Albums/Artists shelves.
+      if (!artwork) {
+        cleanup();
+        return res.status(400).json({ error: "Artwork URL is required" });
+      }
+
       if (!s3 || !R2_BUCKET) {
-        fs.unlink(localPath, () => {});
+        cleanup();
         return res.status(500).json({ error: "R2 storage is not configured on the server" });
       }
 
-      const ext = path.extname(req.file.originalname) || "";
-      const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-
-      // If an album name is given, upload into that folder so it groups
-      // with any other tracks (and cover image) sharing the same album.
-      // Sanitized to prevent path traversal (../) and to keep keys clean.
       const safeAlbumFolder = albumName
         ? albumName.replace(/[^a-zA-Z0-9-_ ]/g, "").trim().replace(/\s+/g, " ")
         : null;
-      const objectKey = safeAlbumFolder
-        ? `tracks/${safeAlbumFolder}/${uniqueName}`
-        : `tracks/${uniqueName}`;
 
-      const contentType = req.file.mimetype || mime.lookup(req.file.originalname) || "application/octet-stream";
+      const results = [];
+      const errors = [];
+      const meta = loadMeta();
 
-      try {
-        const fileStream = fs.createReadStream(localPath);
-        const stat = fs.statSync(localPath);
+      // Uploaded sequentially rather than in parallel — R2/S3 SDK calls
+      // are already async I/O, and sequential keeps error handling and
+      // partial-failure reporting simple (which file failed, and why)
+      // without juggling Promise.allSettled bookkeeping for a batch of 25.
+      for (const file of files) {
+        try {
+          const ext = path.extname(file.originalname) || "";
+          const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+          const objectKey = safeAlbumFolder
+            ? `tracks/${safeAlbumFolder}/${uniqueName}`
+            : `tracks/${uniqueName}`;
 
-        await s3.send(new PutObjectCommand({
-          Bucket: R2_BUCKET,
-          Key: objectKey,
-          Body: fileStream,
-          ContentType: contentType,
-          ContentLength: stat.size
-        }));
+          const contentType = file.mimetype || mime.lookup(file.originalname) || "application/octet-stream";
+          const stat = fs.statSync(file.path);
 
-        const meta = loadMeta();
-        meta[objectKey] = {
-          name: filename,
-          mimeType: contentType,
-          size: stat.size
-        };
-        if (artistName) meta[objectKey].artistName = artistName;
-        if (albumName) meta[objectKey].albumName = albumName;
-        if (artwork) meta[objectKey].artworkUrl = artwork;
-        saveMeta(meta);
+          await s3.send(new PutObjectCommand({
+            Bucket: R2_BUCKET,
+            Key: objectKey,
+            Body: fs.createReadStream(file.path),
+            ContentType: contentType,
+            ContentLength: stat.size
+          }));
 
-        const driveUrl = `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(objectKey)}`;
+          meta[objectKey] = {
+            name: file.originalname.replace(/\.[^/.]+$/, ""), // strip extension for a cleaner default title
+            mimeType: contentType,
+            size: stat.size,
+            artworkUrl: artwork
+          };
+          if (artistName) meta[objectKey].artistName = artistName;
+          if (albumName) meta[objectKey].albumName = albumName;
 
-        res.json({ driveFileId: objectKey, driveUrl });
-      } catch (e) {
-        console.error("R2 upload failed:", e.message);
-        return res.status(502).json({ error: "Upload to R2 failed" });
-      } finally {
-        fs.unlink(localPath, (err) => {
-          if (err) console.warn("Failed to remove temp file:", err.message);
-        });
+          results.push({
+            driveFileId: objectKey,
+            driveUrl: `${req.protocol}://${req.get("host")}/drive/${encodeURIComponent(objectKey)}`,
+            originalName: file.originalname
+          });
+        } catch (e) {
+          console.error(`Upload failed for ${file.originalname}:`, e.message);
+          errors.push({ originalName: file.originalname, error: e.message });
+        }
       }
+
+      saveMeta(meta);
+      cleanup();
+
+      res.json({
+        uploaded: results,
+        failed: errors,
+        totalRequested: files.length,
+        totalSucceeded: results.length
+      });
     } catch (err) {
       console.error("Upload error:", err);
-      if (localPath) fs.unlink(localPath, () => {});
+      cleanup();
       res.status(500).json({ error: "Upload failed" });
     }
   }
@@ -420,6 +440,13 @@ app.post(
 app.post("/drive/edit", requireAdmin, (req, res) => {
   const { id, albumName, artistName, artworkUrl, name } = req.body;
   if (!id) return res.status(400).json({ error: "Missing id" });
+
+  // Artwork is required — reject attempts to clear it to empty, but
+  // allow the field to simply be omitted (meaning "don't change it").
+  if (artworkUrl !== undefined && !artworkUrl) {
+    return res.status(400).json({ error: "Artwork URL is required and cannot be empty" });
+  }
+
   const meta = loadMeta();
   meta[id] = meta[id] || {};
   if (name !== undefined) meta[id].name = name;
@@ -428,6 +455,37 @@ app.post("/drive/edit", requireAdmin, (req, res) => {
   if (artworkUrl !== undefined) meta[id].artworkUrl = artworkUrl;
   saveMeta(meta);
   res.json({ id, meta: meta[id] });
+});
+
+// ---------- Bulk edit: apply the same field changes to many tracks ----------
+// Used by the frontend's multi-select mode in Library. Any field left
+// out of an individual item's payload is simply not touched for that
+// track, same semantics as the single-edit endpoint.
+
+app.post("/drive/edit-bulk", requireAdmin, (req, res) => {
+  const { ids, albumName, artistName, artworkUrl, name } = req.body;
+
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: "Missing ids array" });
+  }
+  if (artworkUrl !== undefined && !artworkUrl) {
+    return res.status(400).json({ error: "Artwork URL is required and cannot be empty" });
+  }
+
+  const meta = loadMeta();
+  const updated = [];
+
+  for (const id of ids) {
+    meta[id] = meta[id] || {};
+    if (name !== undefined) meta[id].name = name;
+    if (albumName !== undefined) meta[id].albumName = albumName;
+    if (artistName !== undefined) meta[id].artistName = artistName;
+    if (artworkUrl !== undefined) meta[id].artworkUrl = artworkUrl;
+    updated.push(id);
+  }
+
+  saveMeta(meta);
+  res.json({ updated, count: updated.length });
 });
 
 // ---------- Delete a track + its metadata ----------
