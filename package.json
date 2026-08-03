@@ -1,25 +1,22 @@
 {
   "name": "musicfy-backend",
   "version": "3.0.0",
-  "description": "Musicfy Railway Backend using Cloudflare R2",
+  "private": true,
+  "description": "Musicfy backend using Railway, Cloudflare R2 and PostgreSQL",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.822.0",
-    "@aws-sdk/lib-storage": "^3.822.0",
-    "compression": "^1.8.1",
+    "@aws-sdk/client-s3": "^3.750.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.6.1",
-    "express": "^4.21.2",
-    "helmet": "^8.1.0",
-    "mime-types": "^3.0.1",
-    "multer": "^2.0.2",
-    "music-metadata": "^11.8.3",
-    "uuid": "^11.1.0"
+    "express": "^5.1.0",
+    "multer": "^2.0.0",
+    "pg": "^8.13.0",
+    "helmet": "^8.0.0",
+    "compression": "^1.7.4"
   }
 }
