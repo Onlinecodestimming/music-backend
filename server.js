@@ -69,7 +69,12 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB — adjust as needed
+  // Lowered from 200MB — Railway sits behind Cloudflare, which caps
+  // request bodies around 100MB on free/pro plans. A single file this
+  // size is already pushing it once multipart overhead is added, and
+  // a batch of several such files together would reliably fail with
+  // a protocol-level error before ever reaching this code.
+  limits: { fileSize: 60 * 1024 * 1024 }, // 60MB per file
   fileFilter: (req, file, cb) => {
     if (!ALLOWED_EXTENSIONS.test(file.originalname)) {
       return cb(new Error("Only mp3, mp4, wav, m4a, flac, ogg, or aac files are allowed"));
@@ -334,9 +339,10 @@ app.post(
   "/upload",
   requireAdmin,
   (req, res, next) => {
-    // Up to 25 files per request — a generous batch size that still
-    // keeps memory/temp-disk usage on Railway reasonable.
-    upload.array("files", 25)(req, res, (err) => {
+    // Up to 10 files per request — keeps total multipart body size
+    // reasonable given Cloudflare/Railway's proxy limits (~100MB per
+    // request). For bigger libraries, upload in a few smaller batches.
+    upload.array("files", 10)(req, res, (err) => {
       if (err) {
         console.error("Multer error:", err.message);
         return res.status(400).json({ error: err.message });
