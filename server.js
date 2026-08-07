@@ -1,129 +1,249 @@
+"use strict";
+
 const express = require("express");
 const cors = require("cors");
-const path = require("path");
+const helmet = require("helmet");
+const compression = require("compression");
+const multer = require("multer");
+const crypto = require("crypto");
+const { Pool } = require("pg");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "admin123";
+const PORT = process.env.PORT || 8080;
 
-app.use(cors());
-app.use(express.json());
+/* ENV CHECK */
+const required = [
+    "DATABASE_URL", "R2_ENDPOINT", "R2_KEY", 
+    "R2_SECRET", "R2_BUCKET", "PUBLIC_R2_URL"
+];
 
-// In-memory data stores (Connect to your database if configured in your .env)
-let libraryTracks = [];
-let announcements = [];
-
-// Middleware: Authenticate Admin Token
-function requireAdmin(req, res, next) {
-  const auth = req.headers.authorization;
-  const token = auth && auth.split(" ")[1];
-  if (token !== ADMIN_TOKEN) {
-    return res.status(403).json({ error: "Unauthorized: Invalid admin token" });
-  }
-  next();
+for(const env of required){
+    if(!process.env[env]){
+        console.log("Missing environment variable:", env);
+        process.exit(1);
+    }
 }
 
-// ------------------- PUBLIC ROUTES -------------------
-
-// 1. Get Library Tracks
-app.get("/api/library", (req, res) => {
-  res.json({ tracks: libraryTracks });
+/* DATABASE */
+const db = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
 });
 
-// 2. Get Public Announcements
-app.get("/announcements", (req, res) => {
-  res.json({ announcements });
+/* R2 */
+const r2 = new S3Client({
+    region: "auto",
+    endpoint: process.env.R2_ENDPOINT,
+    credentials: {
+        accessKeyId: process.env.R2_KEY,
+        secretAccessKey: process.env.R2_SECRET
+    }
 });
 
-// ------------------- ADMIN ROUTES -------------------
-
-// 3. Admin Overview Stats
-app.get("/admin/stats", requireAdmin, (req, res) => {
-  const albums = new Set(libraryTracks.map(t => t.album).filter(Boolean));
-  const artists = new Set(libraryTracks.map(t => t.artist).filter(Boolean));
-  const covers = libraryTracks.filter(t => t.artwork).length;
-
-  res.json({
-    trackCount: libraryTracks.length,
-    albumCount: albums.size,
-    artistCount: artists.size,
-    totalMB: Math.round(libraryTracks.length * 4.5),
-    coverCount: covers,
-    announcementCount: announcements.length,
-    adminConfigured: true,
-    r2Configured: Boolean(process.env.R2_BUCKET || process.env.R2_ACCOUNT_ID)
-  });
+/* UPLOAD */
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 60 * 1024 * 1024 }
 });
 
-// 4. Post New Announcement
-app.post("/announcements", requireAdmin, (req, res) => {
-  const { message, level } = req.body;
-  if (!message) return res.status(400).json({ error: "Message is required" });
+/* MIDDLEWARE */
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(compression());
+app.use(cors({ origin: "*" }));
+app.use(express.json());
 
-  const newAnnounce = {
-    id: Date.now().toString(),
-    message,
-    level: level || "info",
-    createdAt: new Date().toISOString()
-  };
-  announcements.unshift(newAnnounce);
-  res.json({ success: true, announcement: newAnnounce });
+/* DATABASE SETUP (Now includes Playlist tables) */
+async function setup(){
+    await db.query(`
+        CREATE TABLE IF NOT EXISTS tracks (
+            id UUID PRIMARY KEY,
+            title TEXT,
+            artist TEXT,
+            album TEXT,
+            artwork TEXT,
+            url TEXT,
+            filename TEXT,
+            size BIGINT,
+            created TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS playlists (
+            id UUID PRIMARY KEY,
+            name TEXT,
+            created TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+            playlist_id UUID REFERENCES playlists(id) ON DELETE CASCADE,
+            track_id UUID REFERENCES tracks(id) ON DELETE CASCADE,
+            added_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (playlist_id, track_id)
+        );
+    `);
+}
+
+function checkAdmin(req, res, next){
+    const key = req.headers["x-admin-key"];
+    if(process.env.ADMIN_KEY && key !== process.env.ADMIN_KEY){
+        return res.status(401).json({ error: "Invalid admin key" });
+    }
+    next();
+}
+
+function r2Url(key){
+    return (process.env.PUBLIC_R2_URL.replace(/\/$/, "") + "/" + key);
+}
+
+async function uploadR2(key, buffer, type){
+    await r2.send(
+        new PutObjectCommand({
+            Bucket: process.env.R2_BUCKET,
+            Key: key,
+            Body: buffer,
+            ContentType: type
+        })
+    );
+    return r2Url(key);
+}
+
+/* HEALTH */
+app.get("/health", async(req, res) => {
+    try {
+        await db.query("SELECT 1");
+        res.json({ ok: true, database: true, storage: "r2" });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// 5. Delete Announcement
-app.delete("/announcements/:id", requireAdmin, (req, res) => {
-  const { id } = req.params;
-  announcements = announcements.filter(a => a.id !== id);
-  res.json({ success: true });
+/* GET ALL LIBRARY TRACKS */
+app.get("/api/library", async(req, res) => {
+    try {
+        const result = await db.query(`SELECT * FROM tracks ORDER BY created DESC`);
+        res.json({ tracks: result.rows.map(t => ({
+            id: t.id, title: t.title, artist: t.artist, album: t.album,
+            artwork: t.artwork, url: t.url, filename: t.filename, size: Number(t.size)
+        }))});
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// 6. Edit Track Details (Title, Artist, Album, Track Number, Artwork)
-app.post("/drive/edit", requireAdmin, (req, res) => {
-  const { id, name, artistName, albumName, genre, trackNumber, artworkUrl } = req.body;
-  const track = libraryTracks.find(t => String(t.id) === String(id));
-
-  if (!track) {
-    const updatedTrack = {
-      id: id || Date.now().toString(),
-      title: name,
-      artist: artistName,
-      album: albumName,
-      genre,
-      trackNumber: trackNumber ? parseInt(trackNumber, 10) : null,
-      artwork: artworkUrl
-    };
-    libraryTracks.push(updatedTrack);
-    return res.json({ success: true, track: updatedTrack });
-  }
-
-  track.title = name || track.title;
-  track.artist = artistName || track.artist;
-  track.album = albumName || track.album;
-  track.genre = genre || track.genre;
-  track.trackNumber = trackNumber ? parseInt(trackNumber, 10) : null;
-  track.artwork = artworkUrl || track.artwork;
-
-  res.json({ success: true, track });
+/* PLAYLIST ENDPOINTS */
+app.post("/api/playlists", checkAdmin, async(req, res) => {
+    try {
+        const id = crypto.randomUUID();
+        const { name } = req.body;
+        if(!name) return res.status(400).json({ error: "Playlist name required" });
+        
+        await db.query(`INSERT INTO playlists (id, name) VALUES ($1, $2)`, [id, name]);
+        res.json({ ok: true, playlist: { id, name } });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// 7. Delete Track
-app.delete("/drive/:id", requireAdmin, (req, res) => {
-  const { id } = req.params;
-  libraryTracks = libraryTracks.filter(t => String(t.id) !== String(id));
-  res.json({ success: true });
+app.get("/api/playlists", async(req, res) => {
+    try {
+        const result = await db.query(`SELECT * FROM playlists ORDER BY created DESC`);
+        res.json({ playlists: result.rows });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// ------------------- ERROR HANDLING -------------------
-
-// Catch-all 404 Handler (Always returns JSON, NEVER HTML)
-app.use((req, res) => {
-  res.status(404).json({ error: `Route ${req.originalUrl} not found on server.` });
+app.post("/api/playlists/:playlistId/tracks", checkAdmin, async(req, res) => {
+    try {
+        const { playlistId } = req.params;
+        const { trackId } = req.body;
+        
+        await db.query(
+            `INSERT INTO playlist_tracks (playlist_id, track_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, 
+            [playlistId, trackId]
+        );
+        res.json({ ok: true });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-// Universal Error Handler
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: "Internal Server Error", details: err.message });
+app.get("/api/playlists/:playlistId/tracks", async(req, res) => {
+    try {
+        const { playlistId } = req.params;
+        const result = await db.query(`
+            SELECT t.* FROM tracks t
+            JOIN playlist_tracks pt ON t.id = pt.track_id
+            WHERE pt.playlist_id = $1
+            ORDER BY pt.added_at ASC
+        `, [playlistId]);
+        
+        res.json({ tracks: result.rows });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
-app.listen(PORT, () => console.log(`Musicfy server running on port ${PORT}`));
+/* AM-LYRICS INTEGRATION */
+app.get("/api/lyrics", async (req, res) => {
+    try {
+        const { title, artist } = req.query;
+        if (!title || !artist) {
+            return res.status(400).json({ error: "Title and artist are required" });
+        }
+
+        const formattedFileName = encodeURIComponent(`${title} - ${artist}.lrc`);
+        const githubUrl = `https://raw.githubusercontent.com/binimum/am-lyrics/main/${formattedFileName}`;
+        
+        // Use native fetch to grab lyrics server-side
+        const response = await fetch(githubUrl);
+        if (!response.ok) {
+            return res.status(404).json({ error: "Lyrics not found in repository" });
+        }
+        
+        const lyrics = await response.text();
+        res.json({ ok: true, lyrics });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/* UPLOAD */
+app.post("/upload", checkAdmin, upload.single("file"), async(req, res) => {
+    try {
+        if(!req.file) return res.status(400).json({ error: "No file" });
+        
+        const id = crypto.randomUUID();
+        const ext = req.file.originalname.split(".").pop();
+        const key = `music/${id}.${ext}`;
+        const url = await uploadR2(key, req.file.buffer, req.file.mimetype);
+
+        const track = {
+            id,
+            title: req.body.title || req.file.originalname,
+            artist: req.body.artist || "Unknown",
+            album: req.body.album || "Singles",
+            artwork: req.body.artwork || "",
+            url,
+            filename: req.file.originalname,
+            size: req.file.size
+        };
+
+        await db.query(
+            `INSERT INTO tracks (id, title, artist, album, artwork, url, filename, size) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [track.id, track.title, track.artist, track.album, track.artwork, track.url, track.filename, track.size]
+        );
+
+        res.json({ ok: true, track });
+    } catch(err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/* START */
+setup().then(() => {
+    app.listen(PORT, () => console.log("Musicfy running on", PORT));
+}).catch(err => {
+    console.error("Startup failed", err);
+    process.exit(1);
+});
